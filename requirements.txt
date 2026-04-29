@@ -1,0 +1,7 @@
+pyyaml>=6.0
+numpy>=1.22
+torch>=1.13
+pytest>=7.0
+sidechainnet>=1.0
+trimesh>=4.0
+mp-nerf>=1.0.3

@@ -1,0 +1,43 @@
+phase: 1
+seed: 42
+device: cpu
+
+data:
+  split: casp12
+  max_len: 256
+  synthetic_size: 128
+  use_sidechainnet_if_available: true
+  dynamic_batching: true
+
+model:
+  vocab_size: 21
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dim_feedforward: 256
+  dropout: 0.1
+  max_len: 2048
+  head_hidden: 128
+
+training:
+  batch_size: 8
+  lr: 1e-3
+  epochs: 2
+  steps_per_epoch: 20
+  checkpoint_path: checkpoints/phase1.pt
+
+loss:
+  lambda_distance: 0.5
+
+inference:
+  num_samples: 2
+  checkpoint_path: checkpoints/phase1.pt
+
+postproc:
+  use_nerf: true
+  nerf_impl: mpnerf
+
+export:
+  output_dir: outputs
+  pdb: true
+  gltf: false

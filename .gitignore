@@ -1,0 +1,14 @@
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+
+# Runtime artifacts
+checkpoints/
+outputs/
+
+# Tooling
+.pytest_cache/
