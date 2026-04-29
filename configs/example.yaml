@@ -5,7 +5,6 @@ device: cpu
 data:
   split: casp12
   max_len: 256
-  synthetic_size: 128
   use_sidechainnet_if_available: true
   dynamic_batching: true
 

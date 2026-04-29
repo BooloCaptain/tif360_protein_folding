@@ -79,11 +79,20 @@ def batch_reconstruct(batch_internals):
 
 
 def batch_reconstruct_parallel(batch_internals):
-    """Use MP-NeRF when available, otherwise fallback to sequential.
+    """Reconstruct using MP-NeRF backend with explicit logging.
 
-    Uses batched mp_nerf_torch calls across active chains per residue index.
+    Attempts vectorized MP-NeRF reconstruction. On any error, falls back to sequential NeRF
+    with explicit logging of the fallback.
+
+    Args:
+        batch_internals: list of (L_i, 3) arrays with [d, theta, tau]
+        
+    Returns:
+        list of (L_i, 3) coordinate arrays
     """
     if mp_massive is None or torch is None:
+        print("[INFO] MP-NeRF backend unavailable (mp_nerf not installed or torch missing). "
+              "Using sequential NeRF reconstruction.")
         return batch_reconstruct(batch_internals)
 
     try:
@@ -131,6 +140,10 @@ def batch_reconstruct_parallel(batch_internals):
             nxt = mp_massive.mp_nerf_torch(a, b, c, l, t, x).detach().cpu().numpy()
             coords[active, i, :] = nxt
 
+        print(f"[SUCCESS] MP-NeRF reconstruction completed for {B} chains")
         return [coords[b, :lengths[b], :] for b in range(B)]
-    except Exception:
+        
+    except Exception as e:
+        print(f"[WARNING] MP-NeRF reconstruction failed: {e}")
+        print(f"[INFO] Falling back to sequential NeRF reconstruction")
         return batch_reconstruct(batch_internals)

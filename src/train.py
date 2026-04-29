@@ -34,28 +34,72 @@ def as_float(v, default):
 
 
 def resolve_device(cfg_device):
+    """Resolve target device, failing explicitly if requirements not met.
+    
+    Args:
+        cfg_device: Configured device string (e.g., 'cuda', 'cpu')
+        
+    Returns:
+        torch.device object
+        
+    Raises:
+        RuntimeError: If CUDA requested but unavailable
+    """
     requested = str(cfg_device).lower()
-    if requested.startswith("cuda") and not torch.cuda.is_available():
-        print("warning: CUDA requested but not available; falling back to CPU")
-        return torch.device("cpu")
+    if requested.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device '{cfg_device}' requested in config but not available.\n"
+                f"torch.cuda.is_available() = {torch.cuda.is_available()}\n"
+                f"torch.cuda.device_count() = {torch.cuda.device_count()}\n"
+                f"\nOptions:\n"
+                f"  1. Change config device to 'cpu' for CPU-only training\n"
+                f"  2. Install CUDA toolkit and compatible PyTorch (if you have NVIDIA GPU)\n"
+                f"  3. For AMD GPU on WSL2: Install PyTorch with ROCm support\n"
+                f"  4. For Apple: Use MPS device ('mps')"
+            )
+        return torch.device("cuda")
     return torch.device(cfg_device)
 
 
 def build_loader(cfg):
+    """Build data loader from SidechainNet or real ProteinDataset.
+    
+    CRITICAL: This function will NOT fall back to synthetic data.
+    If SidechainNet is unavailable or fails, it will raise an exception.
+    
+    Args:
+        cfg: Configuration dict
+        
+    Returns:
+        DataLoader object
+        
+    Raises:
+        RuntimeError: If real data cannot be loaded
+    """
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("training", {})
     batch_size = as_int(train_cfg.get("batch_size", 8), 8)
 
-    # Prefer SidechainNet-native split DataLoaders when available.
-    if data_cfg.get("use_sidechainnet_if_available", True):
-        side_loaders = try_sidechainnet_dataloaders(batch_size=batch_size)
-        if side_loaders is not None:
-            return side_loaders["train"]
+    # Try native SidechainNet dataloaders if available
+    use_scn = data_cfg.get("use_sidechainnet_if_available", True)
+    if use_scn:
+        print("[INFO] Attempting to load SidechainNet native dataloaders...")
+        try:
+            side_loaders = try_sidechainnet_dataloaders(batch_size=batch_size)
+            if side_loaders is not None:
+                print("[SUCCESS] Using SidechainNet native train loader")
+                return side_loaders["train"]
+        except RuntimeError as e:
+            # Re-raise to prevent silent fallback
+            print(f"[ERROR] SidechainNet loader initialization failed:\n{e}")
+            raise
 
+    # Fall back to ProteinDataset (which will itself fail if SidechainNet unavailable)
+    print("[INFO] Using ProteinDataset loader (SidechainNet backend)")
     ds = ProteinDataset(
         split=data_cfg.get("split", "casp12"),
         max_len=data_cfg.get("max_len", 256),
-        synthetic_size=data_cfg.get("synthetic_size", 128),
     )
 
     if data_cfg.get("dynamic_batching", True):
@@ -69,7 +113,7 @@ def build_loader(cfg):
 def main():
     cfg = get_config_from_cli_or_env()
     set_seed(cfg.get("seed", 42))
-    device = resolve_device(cfg.get("device", "cpu"))
+    device = resolve_device(cfg.get("device", "cuda"))
 
     model_cfg = cfg.get("model", {})
     model = TransformerBackbone(

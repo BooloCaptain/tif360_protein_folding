@@ -24,10 +24,31 @@ def _pred_to_internals(pred):
 
 
 def resolve_device(cfg_device):
+    """Resolve target device, failing explicitly if requirements not met.
+    
+    Args:
+        cfg_device: Configured device string (e.g., 'cuda', 'cpu')
+        
+    Returns:
+        torch.device object
+        
+    Raises:
+        RuntimeError: If CUDA requested but unavailable
+    """
     requested = str(cfg_device).lower()
-    if requested.startswith("cuda") and not torch.cuda.is_available():
-        print("warning: CUDA requested but not available; falling back to CPU")
-        return torch.device("cpu")
+    if requested.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                f"CUDA device '{cfg_device}' requested in config but not available.\n"
+                f"torch.cuda.is_available() = {torch.cuda.is_available()}\n"
+                f"torch.cuda.device_count() = {torch.cuda.device_count()}\n"
+                f"\nOptions:\n"
+                f"  1. Change config device to 'cpu' for CPU-only inference\n"
+                f"  2. Install CUDA toolkit and compatible PyTorch (if you have NVIDIA GPU)\n"
+                f"  3. For AMD GPU on WSL2: Install PyTorch with ROCm support\n"
+                f"  4. For Apple: Use MPS device ('mps')"
+            )
+        return torch.device("cuda")
     return torch.device(cfg_device)
 
 
@@ -36,10 +57,10 @@ def main():
     device = resolve_device(cfg.get("device", "cpu"))
 
     data_cfg = cfg.get("data", {})
+    print("[INFO] Loading real protein data (SidechainNet backend)...")
     ds = ProteinDataset(
         split=data_cfg.get("split", "casp12"),
         max_len=data_cfg.get("max_len", 256),
-        synthetic_size=data_cfg.get("synthetic_size", 128),
     )
 
     num_samples = cfg.get("inference", {}).get("num_samples", 2)

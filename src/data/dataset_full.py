@@ -18,36 +18,53 @@ AA_TO_IDX = {
 IDX_TO_AA = {v:k for k,v in AA_TO_IDX.items()}
 
 class ProteinDataset(Dataset):
-    """Dataset wrapper that uses SidechainNet when available, else synthetic data.
+    """Dataset wrapper that loads real protein structures from SidechainNet.
+    
+    IMPORTANT: This dataset requires SidechainNet to be installed and accessible.
+    It will NOT silently fall back to synthetic data under any circumstances.
 
     Each item is a dict with keys:
       - 'tokens': LongTensor (L,) integers 1..20 (0 reserved for padding)
       - 'mask': FloatTensor (L,) 1.0 for present residues
       - 'angles': FloatTensor (L,2) theta,tau in radians (targets)
       - 'distances': FloatTensor (L,) distances (targets)
-      - 'coords': FloatTensor (L,3) optional C-alpha coordinates when available
+      - 'coords': FloatTensor (L,3) C-alpha coordinates
     """
-    def __init__(self, split='casp12', max_len=1024, synthetic_size=100):
+    def __init__(self, split='casp12', max_len=1024):
+        """Load real protein dataset from SidechainNet.
+        
+        Args:
+            split: Dataset split name (e.g., 'casp12')
+            max_len: Maximum sequence length
+            
+        Raises:
+            RuntimeError: If SidechainNet is not installed or dataset cannot be loaded
+        """
+        if scn is None:
+            raise RuntimeError(
+                "SidechainNet is required but not installed. "
+                "Install it with: pip install sidechainnet"
+            )
+        
         self.split = split
         self.max_len = max_len
-        self.synthetic_size = synthetic_size
-        if scn is not None:
-            # SidechainNet APIs differ by version. Use a broad call and fallback to synthetic.
-            try:
-                self.data = scn.load(self.split)
-            except Exception:
-                self.data = None
-        else:
-            self.data = None
+        
+        try:
+            self.data = scn.load(self.split)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to load SidechainNet dataset '{split}': {e}\n"
+                "Ensure SidechainNet is properly installed and the split exists."
+            ) from e
 
     def __len__(self):
-        if self.data is not None:
-            return len(self.data)
-        return self.synthetic_size
+        if self.data is None:
+            raise RuntimeError("Dataset not initialized")
+        return len(self.data)
 
     def get_length(self, idx):
         if self.data is None:
-            return min(50 + (idx % 50), self.max_len)
+            raise RuntimeError("Dataset not initialized")
         rec = self.data[idx]
         seq = rec.get('primary') or rec.get('sequence') or rec.get('seq') or ''
         return len(seq)
@@ -58,14 +75,7 @@ class ProteinDataset(Dataset):
 
     def __getitem__(self, idx):
         if self.data is None:
-            # synthetic example
-            L = min(50 + (idx % 50), self.max_len)
-            seq = ''.join(['A' for _ in range(L)])
-            tokens = self._seq_to_tokens(seq)
-            mask = np.ones(L, dtype=np.float32)
-            coords = _synthetic_ca_coords(L)
-            angles, distances = ca_to_internal_targets(coords)
-            return {'tokens': tokens, 'mask': mask, 'angles': angles, 'distances': distances, 'coords': coords}
+            raise RuntimeError("Dataset not initialized")
 
         rec = self.data[idx]
         # SidechainNet record fields may vary by version; attempt common keys
@@ -75,7 +85,12 @@ class ProteinDataset(Dataset):
         coords = _extract_ca_coords(rec)
         if coords is None:
             L = len(tokens)
-            coords = _synthetic_ca_coords(L)
+            raise RuntimeError(
+                f"Failed to extract C-alpha coordinates from record at index {idx}. "
+                f"Sequence length: {L}. "
+                f"Record keys: {set(rec.keys()) if isinstance(rec, dict) else 'N/A'}\n"
+                f"This indicates the SidechainNet data format is not compatible with this loader."
+            )
 
         L = min(len(tokens), coords.shape[0], self.max_len)
         tokens = tokens[:L]
@@ -116,26 +131,38 @@ def _extract_ca_coords(rec):
     - (L, 3): already CA trace
     - (L, A, 3): atom axis includes CA at index 1 for many formats
     - (L, 14, 3): sidechain atom-14 format
+    
+    Raises:
+        RuntimeError: If coordinates cannot be extracted from the record
     """
     coords = _rec_get(rec, ('coords', 'coords_pdb', 'crd'), default=None)
     if coords is None:
-        return None
+        rec_keys = set(rec.keys()) if isinstance(rec, dict) else 'N/A'
+        raise RuntimeError(
+            f"Coordinates field not found in record. "
+            f"Expected one of: 'coords', 'coords_pdb', 'crd'. "
+            f"Available keys: {rec_keys}"
+        )
+    
     arr = np.asarray(coords)
+    
     if arr.ndim == 2 and arr.shape[-1] == 3:
         return arr.astype(np.float32)
+    
     if arr.ndim == 3 and arr.shape[-1] == 3:
         # Typical order starts with N, CA, C, O; CA index is 1.
         if arr.shape[1] > 1:
             return arr[:, 1, :].astype(np.float32)
-    return None
-
-
-def _synthetic_ca_coords(L):
-    # Straight-ish backbone surrogate used when real coordinates are unavailable.
-    x = np.arange(L, dtype=np.float32) * 3.8
-    y = np.zeros(L, dtype=np.float32)
-    z = np.zeros(L, dtype=np.float32)
-    return np.stack([x, y, z], axis=-1)
+        else:
+            raise RuntimeError(
+                f"Cannot extract CA from atom dimension: shape {arr.shape} "
+                f"has insufficient atoms (need at least 2, CA at index 1)"
+            )
+    
+    raise RuntimeError(
+        f"Unexpected coordinate array shape: {arr.shape}. "
+        f"Expected (L, 3) for CA trace or (L, A, 3) for atom-indexed format."
+    )
 
 
 def _safe_norm(v, eps=1e-8):
@@ -221,33 +248,69 @@ def collate_fn(batch: List[dict]):
     return {'tokens': tokens, 'mask': mask, 'angles': angles, 'distances': distances, 'coords': coords, 'lengths': lengths}
 
 
-def try_sidechainnet_dataloaders(batch_size=8):
-    """Best-effort helper to request split DataLoaders directly from sidechainnet.load().
-
-    SidechainNet has changed APIs across versions. This tries known signatures and
-    returns a dict with train/valid/test DataLoaders when successful.
+def try_sidechainnet_dataloaders(batch_size=8, casp_version=12, thinning=30):
+    """Attempt to load split DataLoaders directly from SidechainNet.
+    
+    Tries multiple API signatures to accommodate different SidechainNet versions.
+    
+    Args:
+        batch_size: Batch size for DataLoaders
+        casp_version: CASP version to load
+        thinning: Thinning factor for data sampling
+        
+    Returns:
+        dict with 'train', 'valid', 'test' keys, or None if SidechainNet unavailable
+        
+    Raises:
+        RuntimeError: If SidechainNet is installed but all API signatures fail
     """
     if scn is None:
+        print("[INFO] SidechainNet not installed. Native dataloaders unavailable.")
         return None
 
     candidates = [
-        {"with_pytorch": "dataloaders", "batch_size": batch_size},
-        {"with_pytorch": True, "batch_size": batch_size},
-        {"batch_size": batch_size},
+        # Modern SidechainNet API
+        {"casp_version": casp_version, "casp_thinning": thinning, "with_pytorch": "dataloaders", "batch_size": batch_size},
+        # Older SidechainNet API (uses 'thinning' instead of 'casp_thinning')
+        {"casp_version": casp_version, "thinning": thinning, "with_pytorch": "dataloaders", "batch_size": batch_size},
+        # Fallback without dataloaders flag
+        {"casp_version": casp_version, "thinning": thinning, "batch_size": batch_size},
     ]
 
-    for kwargs in candidates:
+    errors = []
+    for i, kwargs in enumerate(candidates):
         try:
             obj = scn.load(**kwargs)
-        except Exception:
+            print(f"[SUCCESS] SidechainNet loaded with API signature #{i+1}: {kwargs}")
+            
+            # Check for dict returns
+            if isinstance(obj, dict):
+                keys = set(obj.keys())
+                if {"train", "valid", "test"}.issubset(keys):
+                    return {"train": obj["train"], "valid": obj["valid"], "test": obj["test"]}
+                elif "train" in keys:
+                    print(f"[WARNING] SidechainNet returned dict but missing all split keys. "
+                          f"Available: {keys}")
+                    return obj
+
+            # Check for tuple/list returns
+            if isinstance(obj, (list, tuple)) and len(obj) >= 3:
+                return {"train": obj[0], "valid": obj[1], "test": obj[2]}
+            
+            errors.append(f"API #{i+1}: Returned unexpected object type {type(obj)}")
+            
+        except Exception as e:
+            errors.append(f"API #{i+1} failed: {e}")
             continue
 
-        if isinstance(obj, dict):
-            keys = set(obj.keys())
-            if {"train", "valid", "test"}.issubset(keys):
-                return {"train": obj["train"], "valid": obj["valid"], "test": obj["test"]}
-
-        if isinstance(obj, (list, tuple)) and len(obj) >= 3:
-            return {"train": obj[0], "valid": obj[1], "test": obj[2]}
-
-    return None
+    # If we get here, SidechainNet is installed but all signatures failed
+    error_msg = (
+        f"SidechainNet is installed but could not load dataset with any API signature.\n"
+        f"Errors encountered:\n"
+    )
+    for err in errors:
+        error_msg += f"  - {err}\n"
+    error_msg += f"\nThis may indicate an incompatibility between this loader and your "
+    error_msg += f"SidechainNet version. Consider updating both or checking SidechainNet documentation."
+    
+    raise RuntimeError(error_msg)
