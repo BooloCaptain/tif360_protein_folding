@@ -30,32 +30,72 @@ class ProteinDataset(Dataset):
       - 'distances': FloatTensor (L,) distances (targets)
       - 'coords': FloatTensor (L,3) C-alpha coordinates
     """
-    def __init__(self, split='casp12', max_len=1024):
+    def __init__(self, split='test', casp_version=12, thinning=30, max_len=1024, raw_data=None):
         """Load real protein dataset from SidechainNet.
         
         Args:
-            split: Dataset split name (e.g., 'casp12')
+            split: Which data split to extract ('train', 'valid-10', 'test', etc.)
+            casp_version: CASP dataset version (default 12)
+            thinning: Thinning factor (default 30 to match your downloaded file)
             max_len: Maximum sequence length
-            
-        Raises:
-            RuntimeError: If SidechainNet is not installed or dataset cannot be loaded
+            raw_data: Optional raw SidechainNet data dictionary.
         """
-        if scn is None:
-            raise RuntimeError(
-                "SidechainNet is required but not installed. "
-                "Install it with: pip install sidechainnet"
-            )
-        
         self.split = split
         self.max_len = max_len
+        self.casp_version = casp_version
+        self.thinning = thinning
         
-        try:
-            self.data = scn.load(self.split)
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to load SidechainNet dataset '{split}': {e}\n"
-                "Ensure SidechainNet is properly installed and the split exists."
-            ) from e
+        if raw_data is not None:
+            self.data = self._parse_raw_data(raw_data, self.split)
+        else:
+            if scn is None:
+                raise RuntimeError(
+                    "SidechainNet is required but not installed. "
+                    "Install it with: pip install sidechainnet"
+                )
+            try:
+                # Explicitly pass the version and thinning so it finds your local file!
+                loaded_data = scn.load(
+                    casp_version=self.casp_version, 
+                    casp_thinning=self.thinning
+                )
+                self.data = self._parse_raw_data(loaded_data, self.split)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load SidechainNet dataset: {e}\n"
+                    "Ensure SidechainNet is properly installed."
+                ) from e
+
+    def _parse_raw_data(self, raw_data, target_split):
+        """Pivots SidechainNet's dict-of-lists into a list-of-dicts for __getitem__"""
+        if isinstance(raw_data, list):
+            return raw_data
+            
+        if isinstance(raw_data, dict):
+            # Look for the specific split requested (e.g., 'test', 'valid-10')
+            if target_split in raw_data and isinstance(raw_data[target_split], dict):
+                raw_data = raw_data[target_split]
+            # If the user passed 'casp12' as the split by mistake, or the split is missing, fallback safely
+            elif 'train' in raw_data and isinstance(raw_data['train'], dict):
+                print(f"[WARNING] Split '{target_split}' not found. Falling back to 'train' split.")
+                raw_data = raw_data['train']
+                
+            keys = list(raw_data.keys())
+            if not keys:
+                return []
+                
+            # Pivot: Use the length of the first list to determine the number of records
+            try:
+                num_items = len(raw_data[keys[0]])
+                parsed = []
+                for i in range(num_items):
+                    rec = {k: raw_data[k][i] for k in keys}
+                    parsed.append(rec)
+                return parsed
+            except TypeError:
+                return [raw_data]
+                
+        return raw_data
 
     def __len__(self):
         if self.data is None:
@@ -66,39 +106,46 @@ class ProteinDataset(Dataset):
         if self.data is None:
             raise RuntimeError("Dataset not initialized")
         rec = self.data[idx]
-        seq = rec.get('primary') or rec.get('sequence') or rec.get('seq') or ''
+        seq = _rec_get(rec, ('seq', 'sequence', 'primary'), default='')
         return len(seq)
 
-    def _seq_to_tokens(self, seq: str):
-        toks = [AA_TO_IDX.get(ch, 0) for ch in seq]
-        return np.array(toks, dtype=np.int64)
+    def _seq_to_tokens(self, seq):
+        if isinstance(seq, str):
+            toks = [AA_TO_IDX.get(ch, 0) for ch in seq]
+            return np.array(toks, dtype=np.int64)
+        elif hasattr(seq, '__len__'):
+            # Fallback just in case SidechainNet hands us pre-computed integers
+            arr = np.asarray(seq)
+            if np.issubdtype(arr.dtype, np.integer):
+                return arr.astype(np.int64)
+        return np.zeros(len(seq), dtype=np.int64)
 
     def __getitem__(self, idx):
         if self.data is None:
             raise RuntimeError("Dataset not initialized")
 
         rec = self.data[idx]
-        # SidechainNet record fields may vary by version; attempt common keys
         seq = _rec_get(rec, ('primary', 'sequence', 'seq'), default='')
         tokens = self._seq_to_tokens(seq)
 
         coords = _extract_ca_coords(rec)
-        if coords is None:
-            L = len(tokens)
-            raise RuntimeError(
-                f"Failed to extract C-alpha coordinates from record at index {idx}. "
-                f"Sequence length: {L}. "
-                f"Record keys: {set(rec.keys()) if isinstance(rec, dict) else 'N/A'}\n"
-                f"This indicates the SidechainNet data format is not compatible with this loader."
-            )
-
         L = min(len(tokens), coords.shape[0], self.max_len)
         tokens = tokens[:L]
         coords = coords[:L]
         angles, distances = ca_to_internal_targets(coords)
-        mask = _extract_missing_mask(rec, L)
+        
+        raw_mask = _extract_missing_mask(rec, L)
+        
+        # THE FIX: Geometric Mask Erosion (Contamination Protection)
+        # If atom i is missing, atoms i, i+1, i+2, and i+3 have corrupted targets
+        geo_mask = raw_mask.copy()
+        for i in range(L):
+            if raw_mask[i] == 0:
+                if i + 1 < L: geo_mask[i + 1] = 0
+                if i + 2 < L: geo_mask[i + 2] = 0
+                if i + 3 < L: geo_mask[i + 3] = 0
 
-        return {'tokens': tokens, 'mask': mask, 'angles': angles, 'distances': distances, 'coords': coords}
+        return {'tokens': tokens, 'mask': geo_mask, 'angles': angles, 'distances': distances, 'coords': coords}
 
 
 def _rec_get(rec, keys, default=None):
@@ -114,14 +161,32 @@ def _rec_get(rec, keys, default=None):
 
 
 def _extract_missing_mask(rec, L):
-    raw = _rec_get(rec, ('mask', 'msk', 'missing_mask'), default=None)
+    raw = _rec_get(rec, ('masks', 'mask', 'msk', 'missing_mask'), default=None)
     if raw is None:
         return np.ones(L, dtype=np.float32)
-    arr = np.asarray(raw).reshape(-1)[:L]
-    if arr.dtype == np.bool_:
-        return arr.astype(np.float32)
-    # SidechainNet masks are often 1 for present, 0 for missing.
-    return (arr > 0).astype(np.float32)
+    
+    # 1. Handle SidechainNet's string format (e.g. "++++---++" or "11001")
+    if isinstance(raw, str):
+        mask_list = [1.0 if char in ('+', '1') else 0.0 for char in raw]
+        arr = np.array(mask_list, dtype=np.float32)
+    else:
+        arr = np.asarray(raw).reshape(-1)
+        # Catch if it became an array of strings: array(['+', '-', '+'])
+        if arr.dtype.kind in {'U', 'S'}:
+            arr = np.array([1.0 if str(c) in ('+', '1') else 0.0 for c in arr], dtype=np.float32)
+        elif arr.dtype == np.bool_:
+            arr = arr.astype(np.float32)
+        else:
+            # Fallback for standard numeric arrays
+            arr = (arr > 0).astype(np.float32)
+            
+    # Safely pad with zeros if the mask is somehow shorter than L, then slice
+    if len(arr) < L:
+        padded = np.zeros(L, dtype=np.float32)
+        padded[:len(arr)] = arr
+        return padded
+        
+    return arr[:L]
 
 
 def _extract_ca_coords(rec):
@@ -129,8 +194,8 @@ def _extract_ca_coords(rec):
 
     Accepts shapes like:
     - (L, 3): already CA trace
+    - (L*14, 3): flattened SidechainNet atom format (14 atoms per residue)
     - (L, A, 3): atom axis includes CA at index 1 for many formats
-    - (L, 14, 3): sidechain atom-14 format
     
     Raises:
         RuntimeError: If coordinates cannot be extracted from the record
@@ -146,6 +211,11 @@ def _extract_ca_coords(rec):
     
     arr = np.asarray(coords)
     
+    # Check if this is a flattened SidechainNet sequence (14 atoms per residue)
+    if arr.ndim == 2 and arr.shape[-1] == 3 and arr.shape[0] % 14 == 0:
+        # Reshape to (L, 14, 3)
+        arr = arr.reshape(-1, 14, 3)
+
     if arr.ndim == 2 and arr.shape[-1] == 3:
         return arr.astype(np.float32)
     
@@ -198,54 +268,76 @@ def ca_to_internal_targets(ca_coords):
 
     Returns:
     - angles: (L, 2) where [:,0] is theta (bond angle), [:,1] is tau (dihedral)
-    - distances: (L,) where i stores |CA_i - CA_{i-1}| (dist[0]=dist[1])
+    - distances: (L,) where i stores |CA_i - CA_{i-1}|
     """
     ca = np.asarray(ca_coords, dtype=np.float32)
     L = ca.shape[0]
     distances = np.full((L,), 3.8, dtype=np.float32)
-    for i in range(1, L):
-        distances[i] = np.linalg.norm(ca[i] - ca[i - 1]).astype(np.float32)
-    if L > 1:
-        distances[0] = distances[1]
-
     theta = np.zeros((L,), dtype=np.float32)
     tau = np.zeros((L,), dtype=np.float32)
-    for i in range(1, L - 1):
-        theta[i] = _bond_angle(ca[i - 1], ca[i], ca[i + 1]).astype(np.float32)
-    for i in range(2, L - 1):
-        tau[i] = _dihedral(ca[i - 2], ca[i - 1], ca[i], ca[i + 1]).astype(np.float32)
 
+    # 1. Map the initial triangle EXACTLY how NeRF reads it
+    if L > 1:
+        distances[0] = np.linalg.norm(ca[1] - ca[0]).astype(np.float32)
     if L > 2:
-        theta[0] = theta[1]
-        theta[-1] = theta[-2]
+        # FIX: NeRF reads index 1 for the second bond length!
+        distances[1] = np.linalg.norm(ca[2] - ca[1]).astype(np.float32)
+        theta[0] = _bond_angle(ca[0], ca[1], ca[2]).astype(np.float32)
+
+    # 2. Map the rest of the chain using standard un-shifted IUPAC math
+    for i in range(3, L):
+        distances[i] = np.linalg.norm(ca[i] - ca[i - 1]).astype(np.float32)
+        theta[i] = _bond_angle(ca[i - 2], ca[i - 1], ca[i]).astype(np.float32)
+        tau[i] = _dihedral(ca[i - 3], ca[i - 2], ca[i - 1], ca[i]).astype(np.float32)
+
+    # 3. Safely pad the unused "dead zones" so the model isn't trained to predict zeros
     if L > 3:
-        tau[0] = tau[2]
-        tau[1] = tau[2]
-        tau[-1] = tau[-2]
+        distances[2] = distances[3]
+        theta[1] = theta[3]
+        theta[2] = theta[3]
+        tau[0] = tau[3]
+        tau[1] = tau[3]
+        tau[2] = tau[3]
 
     angles = np.stack([theta, tau], axis=-1)
     return angles, distances
 
 
 def collate_fn(batch: List[dict]):
-    # pad to max length
     batch_size = len(batch)
     lengths = [item['tokens'].shape[0] for item in batch]
     max_len = max(lengths)
+    
     tokens = torch.zeros((batch_size, max_len), dtype=torch.long)
     mask = torch.zeros((batch_size, max_len), dtype=torch.float32)
     angles = torch.zeros((batch_size, max_len, 2), dtype=torch.float32)
     distances = torch.zeros((batch_size, max_len), dtype=torch.float32)
-    coords = []
+    
+    # THE FIX: Pre-allocate the coords tensor! 
+    # Shape: (Batch, Max_Len * 14 atoms, 3 dimensions (x,y,z))
+    coords = torch.zeros((batch_size, max_len, 3), dtype=torch.float32)
+    
+    # A dedicated mask just for sequence padding
+    pad_mask = torch.ones((batch_size, max_len), dtype=torch.bool) 
+    
     for i, item in enumerate(batch):
         L = item['tokens'].shape[0]
         tokens[i, :L] = torch.from_numpy(item['tokens']).long()
         mask[i, :L] = torch.from_numpy(item['mask']).float()
         angles[i, :L, :] = torch.from_numpy(item['angles']).float()
         distances[i, :L] = torch.from_numpy(item['distances']).float()
-        coords.append(item.get('coords'))
+        pad_mask[i, :L] = False  # False means NOT padding
+        
+        # Fill the pre-allocated coords tensor
+        c_array = item.get('coords')
+        if c_array is not None:
+            coords[i, :L, :] = torch.from_numpy(c_array).float()
 
-    return {'tokens': tokens, 'mask': mask, 'angles': angles, 'distances': distances, 'coords': coords, 'lengths': lengths}
+    return {
+        'tokens': tokens, 'mask': mask, 'angles': angles, 
+        'distances': distances, 'coords': coords, 
+        'lengths': lengths, 'pad_mask': pad_mask
+    }
 
 
 def try_sidechainnet_dataloaders(batch_size=8, casp_version=12, thinning=30):

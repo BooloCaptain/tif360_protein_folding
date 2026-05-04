@@ -10,5 +10,10 @@ venv/
 checkpoints/
 outputs/
 
+# Data
+sidechainnet_data/
+
 # Tooling
 .pytest_cache/
+
+*.html

@@ -9,10 +9,10 @@ from src.models.transformer import TransformerBackbone
 from src.models.heads import TrigDistanceHead
 from src.postproc.exporters import write_pdb, write_gltf
 from src.postproc.diagnostics import rmsd, lever_arm_ratio
+from src.postproc.visualize import kabsch_align, plot_protein_comparison
 
 
 def _pred_to_internals(pred):
-    # pred shape (L,5): [sin(theta),cos(theta),sin(tau),cos(tau),d]
     sin_theta = pred[:, 0]
     cos_theta = pred[:, 1]
     sin_tau = pred[:, 2]
@@ -24,30 +24,10 @@ def _pred_to_internals(pred):
 
 
 def resolve_device(cfg_device):
-    """Resolve target device, failing explicitly if requirements not met.
-    
-    Args:
-        cfg_device: Configured device string (e.g., 'cuda', 'cpu')
-        
-    Returns:
-        torch.device object
-        
-    Raises:
-        RuntimeError: If CUDA requested but unavailable
-    """
     requested = str(cfg_device).lower()
     if requested.startswith("cuda"):
         if not torch.cuda.is_available():
-            raise RuntimeError(
-                f"CUDA device '{cfg_device}' requested in config but not available.\n"
-                f"torch.cuda.is_available() = {torch.cuda.is_available()}\n"
-                f"torch.cuda.device_count() = {torch.cuda.device_count()}\n"
-                f"\nOptions:\n"
-                f"  1. Change config device to 'cpu' for CPU-only inference\n"
-                f"  2. Install CUDA toolkit and compatible PyTorch (if you have NVIDIA GPU)\n"
-                f"  3. For AMD GPU on WSL2: Install PyTorch with ROCm support\n"
-                f"  4. For Apple: Use MPS device ('mps')"
-            )
+            raise RuntimeError("CUDA device requested but not available.")
         return torch.device("cuda")
     return torch.device(cfg_device)
 
@@ -59,12 +39,14 @@ def main():
     data_cfg = cfg.get("data", {})
     print("[INFO] Loading real protein data (SidechainNet backend)...")
     ds = ProteinDataset(
-        split=data_cfg.get("split", "casp12"),
-        max_len=data_cfg.get("max_len", 256),
+        split="test",
+        casp_version=12,
+        thinning=30,
+        max_len=data_cfg.get("max_len", 4096),
     )
 
-    num_samples = cfg.get("inference", {}).get("num_samples", 2)
-    loader = DataLoader(ds, batch_size=num_samples, shuffle=False, collate_fn=collate_fn)
+    num_samples = cfg.get("inference", {}).get("num_samples", 16)
+    loader = DataLoader(ds, batch_size=num_samples, shuffle=True, collate_fn=collate_fn)
     batch = next(iter(loader))
 
     model_cfg = cfg.get("model", {})
@@ -83,7 +65,7 @@ def main():
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(ckpt["model"])
-        head.load_state_dict(ckpt["head"])
+        head.load_state_dict(ckpt["head_trig"])
         print(f"loaded checkpoint: {ckpt_path}")
     else:
         print(f"checkpoint not found ({ckpt_path}), running with random weights")
@@ -92,8 +74,8 @@ def main():
     head.eval()
     with torch.no_grad():
         tokens = batch["tokens"].to(device)
-        mask = batch["mask"].to(device)
-        padding_mask = mask == 0
+        # padding_mask is used for sequence reading
+        padding_mask = batch["pad_mask"].to(device)
         h = model(tokens, src_key_padding_mask=padding_mask)
         pred = head(h).cpu().numpy()
 
@@ -105,9 +87,7 @@ def main():
 
     post_cfg = cfg.get("postproc", {})
     if post_cfg.get("use_nerf", True):
-        # Import here to keep post-processing dependencies isolated from training runtime.
         from src.postproc.nerf_runner import batch_reconstruct, batch_reconstruct_parallel
-
         nerf_impl = str(post_cfg.get("nerf_impl", "sequential")).lower()
         if nerf_impl in ("mp-nerf", "mpnerf", "pnerf", "parallel"):
             coords_list = batch_reconstruct_parallel(batch_internals)
@@ -120,31 +100,63 @@ def main():
     out_dir = out_cfg.get("output_dir", "outputs")
     os.makedirs(out_dir, exist_ok=True)
 
+    # Process and visualize each sample
     for i, coords in enumerate(coords_list):
-        if out_cfg.get("pdb", True):
-            pdb_path = os.path.join(out_dir, f"prediction_{i:03d}.pdb")
-            write_pdb(pdb_path, coords)
-            print(f"wrote {pdb_path}")
-        if out_cfg.get("gltf", False):
-            gltf_path = os.path.join(out_dir, f"prediction_{i:03d}.gltf")
-            write_gltf(gltf_path, coords)
-            print(f"wrote {gltf_path}")
-
-        # Optional diagnostic when target coords are present in batch
         target = batch["coords"][i]
+        
         if target is not None:
-            try:
-                target_arr = np.asarray(target)
-                if target_arr.ndim == 3:
-                    target_arr = target_arr[:, 0, :]
-                target_arr = target_arr[: coords.shape[0], :3]
-                ge = rmsd(coords[: target_arr.shape[0]], target_arr)
-                le = np.mean(np.abs(batch_internals[i][: target_arr.shape[0], 1:]))
-                print(
-                    f"sample={i} rmsd={ge:.4f} lever_arm={lever_arm_ratio(le, ge):.4f}"
-                )
-            except Exception as exc:
-                print(f"diagnostic skipped for sample {i}: {exc}")
+            target_arr = np.asarray(target)
+            if target_arr.ndim == 3:
+                target_arr = target_arr[:, 0, :]
+            target_arr = target_arr[: coords.shape[0], :3]
+            
+            # 1. Identify valid indices (not padded, not eroded, not missing)
+            seq_mask = batch["mask"][i][:target_arr.shape[0]].cpu().numpy()
+            valid_idx = (seq_mask > 0) & ~np.isnan(target_arr).any(axis=1)
+            
+            # 2. Find the LONGEST CONTIGUOUS stretch of valid atoms
+            starts = np.where(valid_idx & ~np.r_[False, valid_idx[:-1]])[0]
+            ends = np.where(valid_idx & ~np.r_[valid_idx[1:], False])[0]
+            
+            if len(starts) > 0:
+                best_segment_idx = np.argmax(ends - starts)
+                start_i = starts[best_segment_idx]
+                end_i = ends[best_segment_idx]
+                contig_len = end_i - start_i + 1
+                
+                # Only evaluate if the segment is reasonably long (e.g., > 10 residues)
+                if contig_len >= 10:
+                    valid_coords = coords[start_i : end_i + 1]
+                    valid_target = target_arr[start_i : end_i + 1]
+                    
+                    # 3. Align and calculate RMSD on the contiguous block
+                    aligned_coords = kabsch_align(valid_target, valid_coords)
+                    ge = rmsd(aligned_coords, valid_target)
+                    
+                    pred_angles = batch_internals[i][start_i : end_i + 1, 1:]
+                    le = np.mean(np.abs(pred_angles))
+                    
+                    print(f"sample={i:03d} contig_length={contig_len} rmsd={ge:.4f} Å lever_arm={lever_arm_ratio(le, ge):.4f}")
+                    
+                    # 4. Save exports
+                    if out_cfg.get("pdb", True):
+                        pred_path = os.path.join(out_dir, f"sample_{i:03d}_pred_aligned.pdb")
+                        target_path = os.path.join(out_dir, f"sample_{i:03d}_target.pdb")
+                        write_pdb(pred_path, aligned_coords)
+                        write_pdb(target_path, valid_target)
+
+                    if out_cfg.get("plot", True):
+                        plot_path = os.path.join(out_dir, f"sample_{i:03d}_plot.html")
+                        plot_protein_comparison(
+                            true_coords=valid_target, 
+                            pred_coords=aligned_coords, 
+                            title=f"Sample {i} (Aligned RMSD: {ge:.2f} Å, Length: {contig_len})",
+                            filename=plot_path
+                        )
+                else:
+                    print(f"sample={i:03d} skipped (longest contiguous segment was only {contig_len} residues)")
+            else:
+                print(f"sample={i:03d} skipped (no valid residues found)")
 
 
 if __name__ == "__main__":

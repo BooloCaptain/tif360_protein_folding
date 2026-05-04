@@ -4,19 +4,19 @@ device: cuda
 
 data:
   split: casp12
-  max_len: 150
+  max_len: 200
   use_sidechainnet_if_available: true
   dynamic_batching: true
 
 model:
   vocab_size: 21
-  d_model: 512
-  nhead: 8
-  num_layers: 16
-  dim_feedforward: 2048
+  d_model: 64
+  nhead: 2
+  num_layers: 2
+  dim_feedforward: 256
   dropout: 0.1
   max_len: 2048
-  head_hidden: 256
+  head_hidden: 32
 
 training:
   max_tokens: 25000
@@ -30,7 +30,7 @@ training:
 
 loss:
   lambda_distance: 1.0
-  lambda_3d: 0.1
+  lambda_3d: 0.05
 
 inference:
   num_samples: 64

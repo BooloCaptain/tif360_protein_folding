@@ -26,6 +26,10 @@ def _build_initial_triangle(d1=1.0, d2=1.0, angle=np.pi/2.0):
     return p0, p1, p2
 
 
+def _wrap_to_pi(angle):
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
+
+
 def next_coord(p_im3, p_im2, p_im1, bond_length, bond_angle, dihedral):
     # Vector from i-2 to i-1
     v1 = p_im1 - p_im2
@@ -56,14 +60,23 @@ def reconstruct_chain(internals):
     L = internals.shape[0]
     if L == 0:
         return np.zeros((0,3))
+    if L == 1:
+        return np.zeros((1, 3), dtype=np.float32)
+    if L == 2:
+        d10 = float(internals[0, 0])
+        return np.array([[0.0, 0.0, 0.0], [d10, 0.0, 0.0]], dtype=np.float32)
     # initialize first three points using defaults from first two internals
-    d1 = internals[0,0] if L>0 else 1.0
-    d2 = internals[1,0] if L>1 else d1
-    theta1 = internals[0,1] if L>0 else np.pi/2.0
+    # Keep bootstrap convention aligned with target extraction defaults.
+    d1 = float(internals[0, 0])
+    d2 = float(internals[1, 0]) if L > 1 else d1
+    theta1 = float(internals[0, 1])
     p0, p1, p2 = _build_initial_triangle(d1, d2, theta1)
     coords = [p0, p1, p2]
     for i in range(3, L):
-        d, theta, tau = internals[i,0], internals[i,1], internals[i,2]
+        d = float(internals[i, 0])
+        theta = float(internals[i, 1])
+        # Extractor/reconstructor torsion conventions differ by pi-shift.
+        tau = float(_wrap_to_pi(np.pi - internals[i, 2]))
         p = next_coord(coords[i-3], coords[i-2], coords[i-1], d, theta, tau)
         coords.append(p)
     coords = np.stack(coords[:L], axis=0)
@@ -116,6 +129,14 @@ def batch_reconstruct_parallel(batch_internals):
             L = lengths[b]
             if L == 0:
                 continue
+            if L == 1:
+                coords[b, 0] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                continue
+            if L == 2:
+                coords[b, 0] = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                coords[b, 1] = np.array([d[b, 0], 0.0, 0.0], dtype=np.float32)
+                continue
+
             d1 = d[b, 0]
             d2 = d[b, 1] if L > 1 else d1
             ang = theta[b, 0]
