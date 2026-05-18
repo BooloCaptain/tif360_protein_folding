@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -19,44 +20,8 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
 
     def forward(self, x):
-        # x shape: (batch, seq_len, d_model)
         seq_len = x.size(1)
         return self.pe[:, :seq_len]
-
-
-class RelativePositionalBias(nn.Module):
-    """
-    Computes a learned scalar bias for relative distances between tokens.
-    Based on the T5 / AlphaFold 1D relative positional encoding strategy.
-    """
-    def __init__(self, num_heads, max_distance=32):
-        super().__init__()
-        self.max_distance = max_distance
-        # Total buckets: distance ranges from -max_distance to +max_distance
-        self.num_buckets = 2 * max_distance + 1
-        
-        # We learn a unique bias table for every attention head
-        self.bias_table = nn.Embedding(self.num_buckets, num_heads)
-
-    def forward(self, seq_len, device):
-        # 1. Create a distance matrix: shape [seq_len, seq_len]
-        positions = torch.arange(seq_len, dtype=torch.long, device=device)
-        
-        # dist = row - col. (e.g. dist[2, 0] = 2)
-        distances = positions.unsqueeze(1) - positions.unsqueeze(0)
-        
-        # 2. Clip distances. In biology, anything > 32 residues apart is just "far".
-        distances = torch.clamp(distances, -self.max_distance, self.max_distance)
-        
-        # 3. Shift from [-max, max] to strictly positive indices [0, 2*max] for the Embedding layer
-        distances = distances + self.max_distance
-
-        # 4. Look up embeddings: shape -> [seq_len, seq_len, num_heads]
-        bias = self.bias_table(distances)
-        
-        # 5. Permute to [num_heads, seq_len, seq_len] to align with PyTorch's attention mask shape
-        bias = bias.permute(2, 0, 1)
-        return bias
 
 
 def precompute_freqs(dim, max_len=10000, theta=10000.0):
@@ -66,28 +31,28 @@ def precompute_freqs(dim, max_len=10000, theta=10000.0):
     freqs = torch.outer(t, freqs)  # (max_len, dim // 2)
     return torch.cos(freqs), torch.sin(freqs)
 
+
 def apply_rotary_emb(x, cos, sin):
     """Applies RoPE to a tensor of shape (Batch, Seq_Len, N_Heads, Head_Dim)."""
-    # Split the features in half
     x1, x2 = x.chunk(2, dim=-1)
     rotated = torch.cat([-x2, x1], dim=-1)
     
-    # Expand cos/sin to (1, Seq_Len, 1, Head_Dim // 2) for broadcasting
     cos = cos.unsqueeze(0).unsqueeze(2)
     sin = sin.unsqueeze(0).unsqueeze(2)
     
-    # Duplicate along the feature dimension to match x1/x2 concatenation
     cos = torch.cat([cos, cos], dim=-1)
     sin = torch.cat([sin, sin], dim=-1)
     
     return x * cos + rotated * sin
 
-class SDPA_TransformerBlock(nn.Module):
-    """A modern Transformer Block using FlashAttention via SDPA."""
-    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+
+class TwoTrack_TransformerBlock(nn.Module):
+    """A modern Transformer Block using 1D Sequence and 2D Pair representation."""
+    def __init__(self, d_model, nhead, dim_feedforward, dropout, d_pair=64):
         super().__init__()
         self.nhead = nhead
         self.head_dim = d_model // nhead
+        self.d_pair = d_pair
         
         self.norm1 = nn.LayerNorm(d_model)
         self.qkv = nn.Linear(d_model, d_model * 3)
@@ -101,8 +66,19 @@ class SDPA_TransformerBlock(nn.Module):
             nn.Linear(dim_feedforward, d_model),
             nn.Dropout(dropout)
         )
+
+        # --- The 2D Bridge Components ---
+        # 1. Projects the 2D pair track down to an attention bias (1 scalar per head)
+        self.pair_to_bias = nn.Linear(d_pair, nhead)
         
-    def forward(self, x, cos, sin, attn_mask=None):
+        # [THE FIX]: Zero-initialize the pair bias so step 0 starts with clean, unbiased attention!
+        nn.init.zeros_(self.pair_to_bias.weight)
+        nn.init.zeros_(self.pair_to_bias.bias)
+        
+        # 2. Projects the concatenated 1D states back into the 2D track dimension
+        self.outer_product_proj = nn.Linear(d_model * 2, d_pair)
+        
+    def forward(self, x, pair_track, cos, sin, padding_mask_bool=None):
         B, L, D = x.shape
         
         # 1. Pre-norm and QKV projection
@@ -110,7 +86,7 @@ class SDPA_TransformerBlock(nn.Module):
         qkv = self.qkv(h).reshape(B, L, 3, self.nhead, self.head_dim)
         q, k, v = qkv.unbind(2) 
         
-        # 2. Apply RoPE to Queries and Keys (Handles relative positions naturally)
+        # 2. Apply RoPE
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         
@@ -119,18 +95,41 @@ class SDPA_TransformerBlock(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
             
-        # 4. SDPA with proper padding mask! 
-        # Since it's a boolean mask, PyTorch can still use memory-efficient attention backends.
+        # 4. Inject explicit 2D Pair Beliefs as Attention Bias
+        # Shape: (B, L, L, d_pair) -> (B, L, L, nhead) -> (B, nhead, L, L)
+        pair_bias = self.pair_to_bias(pair_track).permute(0, 3, 1, 2)
+        
+        # To combine pair_bias with standard padding masks in SDPA, 
+        # we must use a float mask rather than a boolean mask.
+        if padding_mask_bool is not None:
+            # padding_mask_bool expects: True = valid token, False = pad
+            float_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=x.dtype)
+            float_mask.masked_fill_(~padding_mask_bool, float('-inf'))
+            attn_mask = pair_bias + float_mask
+        else:
+            attn_mask = pair_bias
+
+        # Execute attention with the 2D spatial bias explicitly guiding it
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
         
         # 5. Reshape back and project
         out = out.transpose(1, 2).reshape(B, L, D)
         out = self.proj(out)
         
-        # 6. Residuals & FFN
+        # 6. Residuals & 1D FFN
         x = x + out
         x = x + self.ffn(self.norm2(x))
-        return x
+
+        # 7. 1D updates the 2D Track (Outer Product)
+        # We expand x to create a pairwise concatenation for every (i, j) token combination
+        left_1d = x.unsqueeze(2).expand(-1, -1, L, -1)   # (B, L, L, d_model)
+        right_1d = x.unsqueeze(1).expand(-1, L, -1, -1)  # (B, L, L, d_model)
+        
+        # Concatenate and project down to update the 2D track
+        outer_concat = torch.cat([left_1d, right_1d], dim=-1)
+        pair_track = pair_track + self.outer_product_proj(outer_concat)
+        
+        return x, pair_track
 
 
 class TransformerBackbone(nn.Module):
@@ -138,10 +137,18 @@ class TransformerBackbone(nn.Module):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, d_model)
         
-        # REMOVED: self.rel_bias (Redundant with RoPE and destroys VRAM)
+        # Initialize 2D Pair parameters
+        self.d_pair = 64
+        self.pair_proj_left = nn.Linear(d_model, self.d_pair)
+        self.pair_proj_right = nn.Linear(d_model, self.d_pair)
+        
+        # [THE FIX]: 2D Relative Positional Embedding
+        # Distances from -32 to +32 = 65 buckets. Everything further is clamped.
+        self.max_dist = 32
+        self.rel_pos_emb = nn.Embedding(self.max_dist * 2 + 1, self.d_pair)
         
         self.layers = nn.ModuleList([
-            SDPA_TransformerBlock(d_model, nhead, dim_feedforward, dropout)
+            TwoTrack_TransformerBlock(d_model, nhead, dim_feedforward, dropout, self.d_pair)
             for _ in range(num_layers)
         ])
         
@@ -157,26 +164,44 @@ class TransformerBackbone(nn.Module):
         
         cos = self.rope_cos[:seq_len]
         sin = self.rope_sin[:seq_len]
-        
-        # 1. Create the base Local Window Mask
-        # (A window of 16 is plenty for a dataset governed by immediate neighbors)
-        attn_mask = create_local_window_mask(seq_len, window_size=16, device=x.device)
-        
-        # 2. Combine with the Padding Mask (if provided)
-        if src_key_padding_mask is not None:
-            # Padding mask: True = pad, False = valid
-            # We want False where it's a pad token, so we invert it
-            valid_tokens = (~src_key_padding_mask.bool()).unsqueeze(1).unsqueeze(2)
-            
-            # Logical AND: Must be within the sliding window AND a valid token
-            attn_mask = attn_mask & valid_tokens
-            
-        # 3. Broadcast to batch size (optional but safer for SDPA)
-        attn_mask = attn_mask.expand(tokens.shape[0], -1, -1, -1)
 
+        # 1. Initialize the 2D Pair Track from 1D token embeddings
+        left = self.pair_proj_left(x).unsqueeze(2)  # (B, L, 1, D_pair)
+        right = self.pair_proj_right(x).unsqueeze(1) # (B, 1, L, D_pair)
+        pair_track = left + right # Broadcasting creates (B, L, L, D_pair)
+        
+        # [THE FIX]: Inject 2D relative distance awareness!
+        positions = torch.arange(seq_len, device=x.device)
+        # Calculate matrix of relative distances (i - j)
+        distances = positions.unsqueeze(1) - positions.unsqueeze(0)
+        distances = torch.clamp(distances, -self.max_dist, self.max_dist)
+        distances = distances + self.max_dist # Shift to 0-64 for embedding lookup
+        
+        # Look up embeddings and add to pair track
+        # Shape: (L, L, d_pair) -> (1, L, L, d_pair) so it broadcasts over batch
+        pair_track = pair_track + self.rel_pos_emb(distances).unsqueeze(0)
+        
+        # 2. Prepare the padding mask format for the layers
+        padding_mask_bool = None
+        if src_key_padding_mask is not None:
+            # Standard PyTorch padding: True = pad, False = valid token
+            # We invert to: True = valid token, False = ignore
+            padding_mask_bool = (~src_key_padding_mask.bool()).unsqueeze(1).unsqueeze(2)
+
+        # 3. Layer Loop with VRAM-saving Gradient Checkpointing
         for layer in self.layers:
-            x = layer(x, cos, sin, attn_mask=attn_mask)
+            # We use gradient checkpointing to prevent OOM errors on the massive O(L^2) pair_track
+            x, pair_track = checkpoint(
+                layer, 
+                x, 
+                pair_track, 
+                cos, 
+                sin, 
+                padding_mask_bool,
+                use_reentrant=False
+            )
             
+        # You can also return pair_track if you plan to add a 2D loss head (e.g., distogram head) later
         return x
 
 def create_local_window_mask(seq_len, window_size=16, device='cpu'):

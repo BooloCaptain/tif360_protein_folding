@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint
 
-from src.postproc.visualize import plot_protein_comparison
+from src.postproc.visualize import kabsch_align, plot_protein_comparison
 from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.data.batching import MaxTokensBatchSampler
@@ -228,6 +228,10 @@ def main():
     warmup_steps_3d = as_int(cfg.get("training", {}).get("warmup_steps_3d", 500), 500)
 
     # [FIX 4]: Flatten the training loop. No more "for epoch in epochs:" 
+    # Added gradient accumulation steps to simulate larger batches on small VRAM
+    accumulation_steps = 4
+    optimizer.zero_grad(set_to_none=True)
+
     for step in range(total_steps):
         current_lambda_3d = min(1.0, step / warmup_steps_3d) * lambda_3d_base
         
@@ -240,28 +244,25 @@ def main():
         angles = batch["angles"].to(device, non_blocking=True)
         distances = batch["distances"].to(device, non_blocking=True)
         padding_mask = batch["pad_mask"].to(device, non_blocking=True)
-
-        # invert padding mask for src_key_padding_mask (True for positions that should be masked)
-        #padding_mask = ~padding_mask.bool()
-
         target_coords = batch["coords"].to(device, non_blocking=True) 
 
-        optimizer.zero_grad(set_to_none=True)
-
+        # --- FORWARD PASS (Mixed Precision) ---
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             h = model(tokens, src_key_padding_mask=padding_mask)
-            
             # 1. Base prediction (receives ONLY Trig gradients)
             pred_1d = head_trig(h)
             
+        # --- GEOMETRY & LOSS (Strict Float32) ---
         pred_1d = pred_1d.float()
         
-        # Calculate Global Loss ONLY on the final prediction
-        pred_coords = angles_to_3d_coords_memory_safe(pred_1d, tokens, device)
+        # [THE FIX: Prevent Scaling Collapse]
+        pred_1d_for_3d = pred_1d.clone()
+        pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
         
-        # Calculate Local Loss ONLY on the base prediction
+        pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
+        
         loss_total, mse_trig, mse_dist_1d, loss_3d = end_to_end_loss(
-            pred_1d=pred_1d, # Base goes here
+            pred_1d=pred_1d, 
             target_angles=angles,
             target_distances=distances,
             pred_coords=pred_coords,
@@ -271,35 +272,45 @@ def main():
             mask=mask
         )
 
-        scaler.scale(loss_total).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        scale_before = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        scale_after = scaler.get_scale()
-        
-        if scale_before <= scale_after:
-            scheduler.step()
+        # Save the unscaled loss for accurate logging
+        unscaled_loss = loss_total.item()
 
+        # Scale the loss if accumulating gradients over multiple steps
+        loss_total = loss_total / accumulation_steps
+
+        # --- BACKWARD PASS ---
+        loss_total.backward()
+
+        # Step the optimizer only after accumulating enough gradients
+        if (step + 1) % accumulation_steps == 0 or (step + 1) == total_steps:
+            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head_trig.parameters()), max_norm=1.0)
+            optimizer.step()
+            
+            # [THE FIX: Advance the Learning Rate!]
+            scheduler.step()
+            
+            optimizer.zero_grad(set_to_none=True)
+
+        # --- LOGGING & VISUALIZATION ---
         if step % 100 == 0:
-            print(f"step={step} loss={loss_total.item():.4f} "
+            current_lr = scheduler.get_last_lr()[0]
+            print(f"step={step:5d} lr={current_lr:.6f} loss={unscaled_loss:.4f} "
                   f"[trig={mse_trig.item():.4f} dist1D={mse_dist_1d.item():.4f} dRMSD_3D={loss_3d.item():.4f}]")
             
             viz_index = 0
-            # 1. Get the true length of item 10 using the mask
             valid_len = int(mask[viz_index].sum().item())
             
-            # 2. Slice both tensors to only include the valid atoms
             true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
             pred_valid = pred_coords[viz_index, :valid_len].cpu().detach().numpy()
+
+            # [THE FIX: Kabsch Alignment]
+            # pred_valid_aligned = kabsch_align(true_valid, pred_valid)
 
             plot_protein_comparison(
                 true_coords=true_valid, 
                 pred_coords=pred_valid, 
-                title=f"TEST (Len: {valid_len})",
-                filename="test_reconstruction_roundtrip.html"
+                title=f"Train step {step} (Loss: {unscaled_loss:.4f})",
+                filename=f"outputs/full_eval/train_step_{step:06d}.html"
             )
 
         # Save checkpoint periodically based on steps

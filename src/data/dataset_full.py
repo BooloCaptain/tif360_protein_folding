@@ -136,7 +136,6 @@ class ProteinDataset(Dataset):
         
         raw_mask = _extract_missing_mask(rec, L)
         
-        # THE FIX: Geometric Mask Erosion (Contamination Protection)
         # If atom i is missing, atoms i, i+1, i+2, and i+3 have corrupted targets
         geo_mask = raw_mask.copy()
         for i in range(L):
@@ -313,8 +312,6 @@ def collate_fn(batch: List[dict]):
     angles = torch.zeros((batch_size, max_len, 2), dtype=torch.float32)
     distances = torch.zeros((batch_size, max_len), dtype=torch.float32)
     
-    # THE FIX: Pre-allocate the coords tensor! 
-    # Shape: (Batch, Max_Len * 14 atoms, 3 dimensions (x,y,z))
     coords = torch.zeros((batch_size, max_len, 3), dtype=torch.float32)
     
     # A dedicated mask just for sequence padding

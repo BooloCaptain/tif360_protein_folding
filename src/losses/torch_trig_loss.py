@@ -67,7 +67,7 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
     
     # Clamp the maximum error per pair to 10 Angstroms 
     # This stops the model from panicking over two atoms being 100A apart instead of 50A
-    drmsd_error = torch.clamp(drmsd_error, max=5.0)
+    drmsd_error = torch.clamp(drmsd_error, max=10.0)
 
     # Apply Huber loss to the clamped error
     drmsd_unreduced = F.huber_loss(drmsd_error, torch.zeros_like(drmsd_error), reduction='none', delta=2.0)
@@ -82,14 +82,13 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
         # Create standard 2D mask for valid pairs
         mask_2d = mask_1d.unsqueeze(-1) * mask_1d.unsqueeze(-2) # (B, L, L)
         
-        # [THE FIX]: Sequence-Separation Banding
         # Create a matrix of index distances |i - j|
         idx = torch.arange(L, device=pred_coords.device)
         seq_sep = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1)) # (L, L)
         
         # Only allow gradients for pairs within 30 residues of each other
         # (You can increase this to 60 or 100 later in training)
-        band_mask = (seq_sep < 30).float().unsqueeze(0) # (1, L, L)
+        band_mask = (seq_sep < 100).float().unsqueeze(0) # (1, L, L)
         
         # Combine the valid mask with the banding mask
         mask_2d = mask_2d * band_mask
