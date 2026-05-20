@@ -11,7 +11,7 @@ from src.postproc.visualize import kabsch_align, plot_protein_comparison
 from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.data.batching import MaxTokensBatchSampler
-from src.models.transformer import TransformerBackbone
+from src.models.transformer import ProteinFoldingNetwork, TransformerBackbone
 from src.models.heads import TrigDistanceHead
 from src.losses.torch_trig_loss import end_to_end_loss
 
@@ -170,6 +170,75 @@ def angles_to_3d_coords_memory_safe(pred_1d, sequences, device):
     pred_coords = checkpoint(build_3d_wrapper, bond_lengths, thetas, phis, use_reentrant=False)
     return pred_coords
 
+import torch
+
+def compute_contiguous_drmsd(pred_ca, target_ca, dssp_string):
+    """
+    Evaluates pure local secondary structure by computing dRMSD only 
+    WITHIN individual, contiguous blocks of Helices or Sheets.
+    """
+    # ==========================================
+    # [THE FIX]: Automatically convert NumPy arrays to PyTorch Tensors
+    # ==========================================
+    if isinstance(pred_ca, np.ndarray):
+        pred_ca = torch.from_numpy(pred_ca).float()
+    if isinstance(target_ca, np.ndarray):
+        target_ca = torch.from_numpy(target_ca).float()
+    # ==========================================
+
+    dssp_string = dssp_string[:pred_ca.shape[0]]
+
+    L = pred_ca.shape[0]
+
+    def get_blocks(valid_chars):
+        """Finds all contiguous blocks of matching characters."""
+        blocks = []
+        current_block = []
+        for i, char in enumerate(dssp_string):
+            if char in valid_chars:
+                current_block.append(i)
+            else:
+                if len(current_block) > 3: # Must be at least 4 residues
+                    blocks.append(current_block)
+                current_block = []
+        if len(current_block) > 3:
+            blocks.append(current_block)
+        return blocks
+
+    def evaluate_blocks(blocks):
+        if not blocks: return 0.0
+        
+        total_error = 0.0
+        total_pairs = 0
+        
+        for block in blocks:
+            idx = torch.tensor(block, device=pred_ca.device)
+            p_sub = pred_ca[idx]
+            t_sub = target_ca[idx]
+            
+            p_dist = torch.cdist(p_sub, p_sub)
+            t_dist = torch.cdist(t_sub, t_sub)
+            
+            error = torch.abs(p_dist - t_dist)
+            
+            total_error += error.sum().item()
+            total_pairs += error.numel()
+            
+        return total_error / total_pairs if total_pairs > 0 else 0.0
+
+    helix_chars = ['H', 'G', 'I']
+    sheet_chars = ['E', 'B']
+
+    helix_blocks = get_blocks(helix_chars)
+    sheet_blocks = get_blocks(sheet_chars)
+
+    return {
+        'intra_helix_drmsd': evaluate_blocks(helix_blocks),
+        'intra_sheet_drmsd': evaluate_blocks(sheet_blocks),
+        'helix_count': len(helix_blocks),
+        'sheet_count': len(sheet_blocks)
+    }
+
 
 def main():
     cfg = get_config_from_cli_or_env()
@@ -178,28 +247,23 @@ def main():
     torch.set_float32_matmul_precision('high') # TF32 Speedup
 
     model_cfg = cfg.get("model", {})
-    model = TransformerBackbone(
-        vocab_size=as_int(model_cfg.get("vocab_size", 21), 21),
+    
+    # [FIX]: Initialize the unified network
+    model = ProteinFoldingNetwork(
         d_model=as_int(model_cfg.get("d_model", 128), 128),
+        d_pair=as_int(model_cfg.get("d_pair", 64), 64),
         nhead=as_int(model_cfg.get("nhead", 4), 4),
         num_layers=as_int(model_cfg.get("num_layers", 2), 2),
-        dim_feedforward=as_int(model_cfg.get("dim_feedforward", 256), 256),
-        dropout=as_float(model_cfg.get("dropout", 0.1), 0.1),
-        max_len=as_int(model_cfg.get("max_len", 2048), 2048),
-    ).to(device)
-    
-    head_trig = TrigDistanceHead(
-        d_model=as_int(model_cfg.get("d_model", 128), 128),
-        hidden=as_int(model_cfg.get("head_hidden", 128), 128),
     ).to(device)
 
     if cfg.get("compile", False):
         model = torch.compile(model)
-        head_trig = torch.compile(head_trig)
 
     train_cfg = cfg.get("training", {})
+    
+    # [FIX]: Optimizer only needs to track model.parameters() now
     optimizer = torch.optim.AdamW(
-        list(model.parameters()) + list(head_trig.parameters()), 
+        model.parameters(), 
         lr=float(train_cfg.get("lr", 3e-4)), 
         weight_decay=1e-4
     )
@@ -216,108 +280,129 @@ def main():
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn)
     
     loader = build_loader(cfg)
-    infinite_loader = get_infinite_batches(loader) # Wrap the loader in the infinite generator
+    infinite_loader = get_infinite_batches(loader) 
     
     scaler = torch.amp.GradScaler('cuda')
 
+    # [FIX]: Only need to set the unified model to train
     model.train()
-    head_trig.train()
 
     lambda_3d_base = as_float(cfg.get("loss", {}).get("lambda_3d", 1.0), 1.0)
     lambda_dist_1d = as_float(cfg.get("loss", {}).get("lambda_distance", 1.0), 1.0)
+    lambda_ss = as_float(cfg.get("loss", {}).get("lambda_ss", 0.5), 0.5)
     warmup_steps_3d = as_int(cfg.get("training", {}).get("warmup_steps_3d", 500), 500)
+    warmup_steps_band_mask = as_int(cfg.get("training", {}).get("warmup_steps_band_mask", 500), 500)
+    max_band_mask_size = as_int(cfg.get("training", {}).get("max_band_mask_size", 30), 30)
 
-    # [FIX 4]: Flatten the training loop. No more "for epoch in epochs:" 
-    # Added gradient accumulation steps to simulate larger batches on small VRAM
-    accumulation_steps = 4
+    accumulation_steps = cfg.get("training", {}).get("accumulation_steps", 1)
     optimizer.zero_grad(set_to_none=True)
 
+    average_loss = 0.0
+    average_mse_loss = 0.0
+    average_dist_loss = 0.0
+    average_3d_loss = 0.0
+    average_ss_loss = 0.0  # <-- FIX: Initialize here before the loop
+
     for step in range(total_steps):
-        current_lambda_3d = min(1.0, step / warmup_steps_3d) * lambda_3d_base
+        current_lambda_3d = min(1.0, step / warmup_steps_3d * accumulation_steps) * lambda_3d_base
+        current_band_mask_size = min(max_band_mask_size, int(max_band_mask_size * (step / (warmup_steps_band_mask * accumulation_steps))))
         
-        # Continuously fetch the next batch without draining the workers
         batch = next(infinite_loader)
         
-        # [FIX 3]: Add non_blocking=True to all transfers
         tokens = batch["tokens"].to(device, non_blocking=True)
-        mask = batch["mask"].to(device, non_blocking=True)
+        mask_1d = batch["mask_1d"].to(device, non_blocking=True)
+        mask_3d = batch["mask_3d"].to(device, non_blocking=True)
         angles = batch["angles"].to(device, non_blocking=True)
         distances = batch["distances"].to(device, non_blocking=True)
         padding_mask = batch["pad_mask"].to(device, non_blocking=True)
-        target_coords = batch["coords"].to(device, non_blocking=True) 
+        target_coords = batch["coords"].to(device, non_blocking=True)
+        target_ss = batch["target_ss"].to(device, non_blocking=True)
 
-        # --- FORWARD PASS (Mixed Precision) ---
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            h = model(tokens, src_key_padding_mask=padding_mask)
-            # 1. Base prediction (receives ONLY Trig gradients)
-            pred_1d = head_trig(h)
+            pred_1d, ss_logits = model(tokens, src_key_padding_mask=padding_mask)
             
-        # --- GEOMETRY & LOSS (Strict Float32) ---
         pred_1d = pred_1d.float()
+        ss_logits = ss_logits.float()
         
-        # [THE FIX: Prevent Scaling Collapse]
         pred_1d_for_3d = pred_1d.clone()
         pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
         
         pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
         
-        loss_total, mse_trig, mse_dist_1d, loss_3d = end_to_end_loss(
+        loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss = end_to_end_loss(
             pred_1d=pred_1d, 
             target_angles=angles,
             target_distances=distances,
             pred_coords=pred_coords,
             target_coords=target_coords,
+            ss_logits=ss_logits,      
+            target_ss=target_ss,      
             lambda_dist=lambda_dist_1d,
             lambda_3d=current_lambda_3d,
-            mask=mask
+            lambda_ss=lambda_ss,            
+            mask_1d=mask_1d,
+            mask_3d=mask_3d,
+            band_mask_size=current_band_mask_size
         )
 
-        # Save the unscaled loss for accurate logging
-        unscaled_loss = loss_total.item()
+        average_loss += loss_total.item()
+        average_mse_loss += mse_trig.item()
+        average_dist_loss += mse_dist_1d.item()
+        average_3d_loss += loss_3d.item()
+        average_ss_loss += loss_ss.item()
 
-        # Scale the loss if accumulating gradients over multiple steps
         loss_total = loss_total / accumulation_steps
 
-        # --- BACKWARD PASS ---
+        # Because you are using bfloat16, standard backward is fine without scaling
         loss_total.backward()
 
-        # Step the optimizer only after accumulating enough gradients
         if (step + 1) % accumulation_steps == 0 or (step + 1) == total_steps:
-            torch.nn.utils.clip_grad_norm_(list(model.parameters()) + list(head_trig.parameters()), max_norm=1.0)
+            # [FIX]: Gradient clipping only references model
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
-            # [THE FIX: Advance the Learning Rate!]
             scheduler.step()
-            
             optimizer.zero_grad(set_to_none=True)
 
-        # --- LOGGING & VISUALIZATION ---
         if step % 100 == 0:
             current_lr = scheduler.get_last_lr()[0]
-            print(f"step={step:5d} lr={current_lr:.6f} loss={unscaled_loss:.4f} "
-                  f"[trig={mse_trig.item():.4f} dist1D={mse_dist_1d.item():.4f} dRMSD_3D={loss_3d.item():.4f}]")
+            print(f"step={step:5d} lr={current_lr:.6f} loss={average_loss / 100:.4f} "
+                  f"[trig={average_mse_loss / 100:.4f} dist1D={average_dist_loss / 100:.4f} dRMSD_3D={average_3d_loss / 100:.4f} ss={average_ss_loss / 100:.4f}]")
             
             viz_index = 0
-            valid_len = int(mask[viz_index].sum().item())
+            valid_len = int(mask_1d[viz_index].sum().item())
             
             true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
             pred_valid = pred_coords[viz_index, :valid_len].cpu().detach().numpy()
 
-            # [THE FIX: Kabsch Alignment]
-            # pred_valid_aligned = kabsch_align(true_valid, pred_valid)
+            dssp_str = batch["dssp_strs"][viz_index] 
+
+            metrics = compute_contiguous_drmsd(
+                pred_ca=pred_valid, 
+                target_ca=true_valid, 
+                dssp_string=dssp_str
+            )
+
+            print(f"Diagnostics -> Helix Error: {metrics['intra_helix_drmsd']:.2f}A | "
+                f"Sheet Error: {metrics['intra_sheet_drmsd']:.2f}A | ")
 
             plot_protein_comparison(
                 true_coords=true_valid, 
                 pred_coords=pred_valid, 
-                title=f"Train step {step} (Loss: {unscaled_loss:.4f})",
+                title=f"Train step {step} (Loss: {average_loss / 100:.4f})",
                 filename=f"outputs/full_eval/train_step_{step:06d}.html"
             )
+            
+            average_loss = 0.0
+            average_mse_loss = 0.0
+            average_dist_loss = 0.0
+            average_3d_loss = 0.0
+            average_ss_loss = 0.0  # <-- FIX: Reset the accumulator here too
 
-        # Save checkpoint periodically based on steps
         if (step + 1) % estimated_steps_per_epoch == 0:
             ckpt_path = train_cfg.get("checkpoint_path", f"checkpoints/phase1_step_{step + 1}.pt")
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            torch.save({"model": model.state_dict(), "head_trig": head_trig.state_dict(), "config": cfg}, ckpt_path)
+            # [FIX]: Only save the unified model state
+            torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
             print(f"saved checkpoint: {ckpt_path}")
 
 if __name__ == "__main__":

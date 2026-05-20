@@ -10,31 +10,36 @@ data:
 
 model:
   vocab_size: 21
-  d_model: 64
-  nhead: 2
-  num_layers: 3
-  dim_feedforward: 256
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
   dropout: 0.1
-  max_len: 2048
-  head_hidden: 32
+  max_len: 200
+  head_hidden: 128
+  d_pair: 128
 
 training:
-  max_tokens: 2000
+  max_tokens: 750
   megabatch_size: 10000
-  lr: 3e-4
+  lr: 1e-3 # peak learning rate
   steps: 200000
-  warmup_steps: 2000
-  warmup_steps_3d: 4000
+  warmup_steps: 50
+  warmup_steps_3d: 100
+  warmup_steps_band_mask: 2000
+  max_band_mask_size: 200
   checkpoint_path: checkpoints/phase1_full_mini.pt
   compile: false
+  accumulation_steps: 25
 
 loss:
   lambda_distance: 1.0
-  lambda_3d: 0.05
+  lambda_3d: 0.01 # 0.01
+  lambda_ss: 0.25 # 0.5
 
 inference:
   num_samples: 64
-  checkpoint_path: checkpoints/phase1_full.pt
+  checkpoint_path: checkpoints/phase1_full_mini.pt
 
 postproc:
   use_nerf: true

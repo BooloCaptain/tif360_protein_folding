@@ -9,13 +9,22 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-# simple amino-acid to index mapping (20 standard + padding 0)
-AA_TO_IDX = {
-    'A':1,'R':2,'N':3,'D':4,'C':5,'Q':6,'E':7,'G':8,'H':9,'I':10,
-    'L':11,'K':12,'M':13,'F':14,'P':15,'S':16,'T':17,'W':18,'Y':19,'V':20
+# Replace amino-acid mapping with ESM-2's integer mapping.
+# Note: ESM reserves index 1 for <pad> so our sequences remain aligned with CA coordinates.
+ESM_AA_TO_IDX = {
+    'L': 4, 'A': 5, 'G': 6, 'V': 7, 'S': 8, 'E': 9, 'R': 10, 'T': 11, 'I': 12, 
+    'D': 13, 'P': 14, 'K': 15, 'Q': 16, 'N': 17, 'F': 18, 'Y': 19, 'M': 20, 
+    'H': 21, 'W': 22, 'C': 23, 'X': 24
 }
 
-IDX_TO_AA = {v:k for k,v in AA_TO_IDX.items()}
+# 3-State DSSP vocabulary. 3 is reserved for padding/missing data.
+DSSP_TO_IDX = {
+    'H': 0, 'G': 0, 'I': 0,                 # Alpha Helices
+    'E': 1, 'B': 1,                         # Beta Sheets
+    'T': 2, 'S': 2, '-': 2, 'C': 2, ' ': 2  # Coils / Loops / Unstructured
+}
+
+IDX_TO_AA = {v: k for k, v in ESM_AA_TO_IDX.items()}
 
 class ProteinDataset(Dataset):
     """Dataset wrapper that loads real protein structures from SidechainNet.
@@ -29,6 +38,7 @@ class ProteinDataset(Dataset):
       - 'angles': FloatTensor (L,2) theta,tau in radians (targets)
       - 'distances': FloatTensor (L,) distances (targets)
       - 'coords': FloatTensor (L,3) C-alpha coordinates
+      - 'ss': LongTensor (L,) secondary structure labels
     """
     def __init__(self, split='test', casp_version=12, thinning=30, max_len=1024, raw_data=None):
         """Load real protein dataset from SidechainNet.
@@ -111,14 +121,16 @@ class ProteinDataset(Dataset):
 
     def _seq_to_tokens(self, seq):
         if isinstance(seq, str):
-            toks = [AA_TO_IDX.get(ch, 0) for ch in seq]
+            # Use the ESM mapping. Default to 'X' (24) for unknown characters.
+            toks = [ESM_AA_TO_IDX.get(ch, 24) for ch in seq]
             return np.array(toks, dtype=np.int64)
         elif hasattr(seq, '__len__'):
             # Fallback just in case SidechainNet hands us pre-computed integers
             arr = np.asarray(seq)
             if np.issubdtype(arr.dtype, np.integer):
                 return arr.astype(np.int64)
-        return np.zeros(len(seq), dtype=np.int64)
+        # ESM uses 1 as the padding index, so default to 1 if we must fabricate a sequence
+        return np.ones(len(seq), dtype=np.int64)
 
     def __getitem__(self, idx):
         if self.data is None:
@@ -134,17 +146,37 @@ class ProteinDataset(Dataset):
         coords = coords[:L]
         angles, distances = ca_to_internal_targets(coords)
         
+        # --- NEW: Extract DSSP String ---
+        # SidechainNet uses 'sec' or 'secondary_structure'. Default to spaces if missing.
+        dssp_raw = _rec_get(rec, ('sec', 'secondary_structure', 'dssp'), default=' ' * L)
+        
+        if hasattr(dssp_raw, '__len__') and not isinstance(dssp_raw, str):
+            dssp_str = "".join([str(c) for c in dssp_raw])[:L]
+        else:
+            dssp_str = str(dssp_raw)[:L]
+        # --------------------------------
+        
         raw_mask = _extract_missing_mask(rec, L)
         
-        # If atom i is missing, atoms i, i+1, i+2, and i+3 have corrupted targets
-        geo_mask = raw_mask.copy()
+        mask_1d = raw_mask.copy()
         for i in range(L):
             if raw_mask[i] == 0:
-                if i + 1 < L: geo_mask[i + 1] = 0
-                if i + 2 < L: geo_mask[i + 2] = 0
-                if i + 3 < L: geo_mask[i + 3] = 0
+                if i + 1 < L: mask_1d[i + 1] = 0
+                if i + 2 < L: mask_1d[i + 2] = 0
+                if i + 3 < L: mask_1d[i + 3] = 0
 
-        return {'tokens': tokens, 'mask': geo_mask, 'angles': angles, 'distances': distances, 'coords': coords}
+        mask_3d = raw_mask.copy()
+
+        return {
+            'tokens': tokens,
+            'mask_1d': mask_1d,
+            'mask_3d': mask_3d,
+            'mask': mask_1d,
+            'angles': angles,
+            'distances': distances,
+            'coords': coords,
+            'dssp_str': dssp_str  # <-- NEW
+        }
 
 
 def _rec_get(rec, keys, default=None):
@@ -307,33 +339,52 @@ def collate_fn(batch: List[dict]):
     lengths = [item['tokens'].shape[0] for item in batch]
     max_len = max(lengths)
     
-    tokens = torch.zeros((batch_size, max_len), dtype=torch.long)
-    mask = torch.zeros((batch_size, max_len), dtype=torch.float32)
+    # Fill empty space with 1 (ESM-2 padding token)
+    tokens = torch.ones((batch_size, max_len), dtype=torch.long) * 1 
+    
+    # Allocate separate tensors for the kinematic and geometric masks.
+    mask_1d = torch.zeros((batch_size, max_len), dtype=torch.float32)
+    mask_3d = torch.zeros((batch_size, max_len), dtype=torch.float32)
+    
     angles = torch.zeros((batch_size, max_len, 2), dtype=torch.float32)
     distances = torch.zeros((batch_size, max_len), dtype=torch.float32)
-    
     coords = torch.zeros((batch_size, max_len, 3), dtype=torch.float32)
+    pad_mask = torch.ones((batch_size, max_len), dtype=torch.bool)
+    target_ss = torch.ones((batch_size, max_len), dtype=torch.long) * 3
     
-    # A dedicated mask just for sequence padding
-    pad_mask = torch.ones((batch_size, max_len), dtype=torch.bool) 
+    dssp_strs = []
     
     for i, item in enumerate(batch):
         L = item['tokens'].shape[0]
         tokens[i, :L] = torch.from_numpy(item['tokens']).long()
-        mask[i, :L] = torch.from_numpy(item['mask']).float()
+        mask_1d[i, :L] = torch.from_numpy(item['mask_1d']).float()
+        mask_3d[i, :L] = torch.from_numpy(item['mask_3d']).float()
         angles[i, :L, :] = torch.from_numpy(item['angles']).float()
         distances[i, :L] = torch.from_numpy(item['distances']).float()
-        pad_mask[i, :L] = False  # False means NOT padding
+        pad_mask[i, :L] = False
+        dssp_str = item.get('dssp_str', ' ' * L)
+        dssp_strs.append(dssp_str)
         
-        # Fill the pre-allocated coords tensor
+        # Convert string to integers and place in tensor
+        ss_idx = [DSSP_TO_IDX.get(char, 3) for char in dssp_str]
+        target_ss[i, :L] = torch.tensor(ss_idx, dtype=torch.long)
+
         c_array = item.get('coords')
         if c_array is not None:
             coords[i, :L, :] = torch.from_numpy(c_array).float()
 
     return {
-        'tokens': tokens, 'mask': mask, 'angles': angles, 
-        'distances': distances, 'coords': coords, 
-        'lengths': lengths, 'pad_mask': pad_mask
+        'tokens': tokens, 
+        'mask_1d': mask_1d, 
+        'mask_3d': mask_3d, 
+        'mask': mask_1d, 
+        'angles': angles, 
+        'distances': distances, 
+        'coords': coords, 
+        'lengths': lengths, 
+        'pad_mask': pad_mask,
+        'dssp_strs': dssp_strs,
+        'target_ss': target_ss # <-- NEW: Pass the integer tensor to the training loop
     }
 
 

@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
+import esm
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -71,7 +72,6 @@ class TwoTrack_TransformerBlock(nn.Module):
         # 1. Projects the 2D pair track down to an attention bias (1 scalar per head)
         self.pair_to_bias = nn.Linear(d_pair, nhead)
         
-        # [THE FIX]: Zero-initialize the pair bias so step 0 starts with clean, unbiased attention!
         nn.init.zeros_(self.pair_to_bias.weight)
         nn.init.zeros_(self.pair_to_bias.bias)
         
@@ -133,17 +133,36 @@ class TwoTrack_TransformerBlock(nn.Module):
 
 
 class TransformerBackbone(nn.Module):
-    def __init__(self, vocab_size, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1, max_len=4096):
+    def __init__(self, vocab_size=None, d_model=256, nhead=8, num_layers=6, dim_feedforward=1024, dropout=0.1, max_len=4096, d_pair=64):
         super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, d_model)
+        
+        # ==========================================
+        # Frozen ESM-2 Embeddings
+        # ==========================================
+        print("[INFO] Loading frozen ESM-2 35M model...")
+        self.esm_model, self.esm_alphabet = esm.pretrained.esm2_t12_35M_UR50D()
+        self.esm_layer = 12 # Extract from the final layer of the 35M model
+        self.esm_dim = 480  
+        
+        # Freeze the whole model first...
+        for param in self.esm_model.parameters():
+            param.requires_grad = False
+
+        # ...then unfreeze just the last 2 layers (layers 10 and 11 in the 12-layer model)
+        for layer in self.esm_model.layers[-2:]:
+            for param in layer.parameters():
+                param.requires_grad = True
+            
+        # Project the 480-dim ESM embedding down to your Two-Track d_model dimension
+        self.esm_proj = nn.Linear(self.esm_dim, d_model)
+        # ==========================================
         
         # Initialize 2D Pair parameters
-        self.d_pair = 64
+        self.d_pair = d_pair
         self.pair_proj_left = nn.Linear(d_model, self.d_pair)
         self.pair_proj_right = nn.Linear(d_model, self.d_pair)
         
-        # [THE FIX]: 2D Relative Positional Embedding
-        # Distances from -32 to +32 = 65 buckets. Everything further is clamped.
+        # 2D Relative Positional Embedding
         self.max_dist = 32
         self.rel_pos_emb = nn.Embedding(self.max_dist * 2 + 1, self.d_pair)
         
@@ -159,62 +178,144 @@ class TransformerBackbone(nn.Module):
         self.d_model = d_model
 
     def forward(self, tokens, src_key_padding_mask=None):
-        x = self.token_emb(tokens) * math.sqrt(self.d_model)
-        seq_len = x.shape[1]
+        B, L = tokens.shape
+        device = tokens.device
         
+        # ==========================================
+        # [THE ESM-2 FIX]: Format tokens for the LLM
+        # ==========================================
+        # 1. Create a padded tensor of size L + 2
+        esm_tokens = torch.ones((B, L + 2), dtype=torch.long, device=device) # 1 is <pad>
+        esm_tokens[:, 0] = 0  # Prepend <cls>
+        
+        # 2. Insert the actual protein sequence
+        esm_tokens[:, 1:L+1] = tokens
+        
+        # 3. Find sequence lengths (ignoring the pad token '1') and append <eos> (2)
+        valid_lens = (tokens != 1).sum(dim=1)
+        for i in range(B):
+            esm_tokens[i, valid_lens[i] + 1] = 2  # Append <eos> exactly at the end of the chain
+        
+        # 4. Run through ESM-2
+        self.esm_model.eval()
+        with torch.no_grad():
+            results = self.esm_model(esm_tokens, repr_layers=[self.esm_layer])
+            esm_reps = results["representations"][self.esm_layer]
+            
+        # 5. Slice off the <cls> token to restore the exact length (L)
+        # We take from index 1 to L+1. The <eos> representations fall safely into 
+        # your masked padding zones, meaning they get ignored by the loss!
+        esm_reps_aligned = esm_reps[:, 1:L+1, :]
+        
+        # Project down to your dimension
+        x = self.esm_proj(esm_reps_aligned) * math.sqrt(self.d_model)
+        
+        seq_len = x.shape[1]
         cos = self.rope_cos[:seq_len]
         sin = self.rope_sin[:seq_len]
 
-        # 1. Initialize the 2D Pair Track from 1D token embeddings
-        left = self.pair_proj_left(x).unsqueeze(2)  # (B, L, 1, D_pair)
-        right = self.pair_proj_right(x).unsqueeze(1) # (B, 1, L, D_pair)
-        pair_track = left + right # Broadcasting creates (B, L, L, D_pair)
+        # 1. Initialize the 2D Pair Track
+        left = self.pair_proj_left(x).unsqueeze(2)  
+        right = self.pair_proj_right(x).unsqueeze(1) 
+        pair_track = left + right 
         
-        # [THE FIX]: Inject 2D relative distance awareness!
+        # Inject 2D relative distance awareness!
         positions = torch.arange(seq_len, device=x.device)
-        # Calculate matrix of relative distances (i - j)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
         distances = torch.clamp(distances, -self.max_dist, self.max_dist)
-        distances = distances + self.max_dist # Shift to 0-64 for embedding lookup
-        
-        # Look up embeddings and add to pair track
-        # Shape: (L, L, d_pair) -> (1, L, L, d_pair) so it broadcasts over batch
+        distances = distances + self.max_dist 
         pair_track = pair_track + self.rel_pos_emb(distances).unsqueeze(0)
         
         # 2. Prepare the padding mask format for the layers
         padding_mask_bool = None
         if src_key_padding_mask is not None:
-            # Standard PyTorch padding: True = pad, False = valid token
-            # We invert to: True = valid token, False = ignore
             padding_mask_bool = (~src_key_padding_mask.bool()).unsqueeze(1).unsqueeze(2)
 
         # 3. Layer Loop with VRAM-saving Gradient Checkpointing
         for layer in self.layers:
-            # We use gradient checkpointing to prevent OOM errors on the massive O(L^2) pair_track
             x, pair_track = checkpoint(
-                layer, 
-                x, 
-                pair_track, 
-                cos, 
-                sin, 
-                padding_mask_bool,
-                use_reentrant=False
+                layer, x, pair_track, cos, sin, padding_mask_bool, use_reentrant=False
             )
             
-        # You can also return pair_track if you plan to add a 2D loss head (e.g., distogram head) later
         return x
+
 
 def create_local_window_mask(seq_len, window_size=16, device='cpu'):
     """
     Creates a banded sliding-window attention mask.
     True = compute attention, False = ignore (-inf in softmax).
     """
-    # Create an index grid: [seq_len, seq_len]
     idx = torch.arange(seq_len, device=device)
     dist = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1))
-    
-    # Create a boolean band where distance is within the window
     mask = dist <= window_size
-    
-    # Reshape for SDPA broadcasting across Batch and Heads: (1, 1, seq_len, seq_len)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+# ==========================================
+# [THE UPGRADES]: Output Head & Final Wrapper
+# ==========================================
+
+class TrigDistanceHead(nn.Module):
+    """Hierarchical Head: Predicts SS, then uses SS probabilities to condition Geometry."""
+    def __init__(self, d_model, hidden=128):
+        super().__init__()
+        
+        # 1. SS Head evaluates FIRST
+        self.ss_head = nn.Linear(d_model, 3)
+
+        # 2. Projection accepts the original hidden state PLUS the 3 SS probabilities
+        self.proj = nn.Linear(d_model + 3, hidden)
+        
+        self.out = nn.Linear(hidden, 5)
+        
+        nn.init.zeros_(self.out.weight)
+        self.out.bias.data = torch.tensor([0.0, 1.0, 0.0, 1.0, 3.77])
+
+    def forward(self, h):
+        # --- STEP 1: Predict Secondary Structure ---
+        ss_logits = self.ss_head(h)
+        
+        # Convert logits to stable [0, 1] probabilities for conditioning
+        ss_probs = F.softmax(ss_logits, dim=-1)
+        
+        # --- STEP 2: Condition the Geometry on the SS ---
+        # Concatenate the d_model representations with the 3 SS probabilities
+        h_conditioned = torch.cat([h, ss_probs], dim=-1)
+        
+        # Predict continuous geometry using the conditioned representation
+        x = F.gelu(self.proj(h_conditioned))
+        out = self.out(x)
+        
+        theta_raw = out[..., 0:2]
+        tau_raw = out[..., 2:4]
+        d_raw = out[..., 4:5]
+        d_pos = F.softplus(d_raw)
+        
+        pred_1d = torch.cat([theta_raw, tau_raw, d_pos], dim=-1)
+
+        return pred_1d, ss_logits
+
+
+class ProteinFoldingNetwork(nn.Module):
+    """
+    The top-level wrapper that glues the ESM/Two-Track backbone 
+    and the Trig/SS Head together.
+    """
+    def __init__(self, d_model=256, nhead=8, num_layers=6, d_pair=64):
+        super().__init__()
+        self.backbone = TransformerBackbone(
+            d_model=d_model, 
+            nhead=nhead, 
+            num_layers=num_layers, 
+            d_pair=d_pair
+        )
+        self.head = TrigDistanceHead(d_model=d_model)
+        
+    def forward(self, tokens, src_key_padding_mask=None):
+        # 1. Get the final 1D track hidden states from the Two-Track backbone
+        h = self.backbone(tokens, src_key_padding_mask=src_key_padding_mask)
+        
+        # 2. Pass hidden states to the head to get kinematics and SS logits
+        pred_1d, ss_logits = self.head(h)
+        
+        return pred_1d, ss_logits
