@@ -15,11 +15,108 @@ from src.models.transformer import ProteinFoldingNetwork, TransformerBackbone
 from src.models.heads import TrigDistanceHead
 from src.losses.torch_trig_loss import end_to_end_loss
 
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import ListedColormap
+import matplotlib.patches as mpatches
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
 # --- IMPORT SIDECHAINNET BUILDER ---
 try:
     from sidechainnet.structure.fastbuild import make_coords
 except ImportError:
     raise RuntimeError("Please install sidechainnet to use the 3D builder.")
+
+def plot_distograms(pred_disto, true_disto, pred_ss=None, true_ss=None, save_path="disto_debug.png"):
+    """
+    Plots the 2D Distograms with horizontal colorbars on top to preserve width alignment,
+    with the 1D Secondary Structure beneath them.
+    """
+    if pred_ss is not None and true_ss is not None:
+        # Create a 2x2 grid. Slightly taller to accommodate top colorbars.
+        fig, axes = plt.subplots(2, 2, figsize=(12, 7), gridspec_kw={'height_ratios': [1, 0.08]})
+        
+        # --- ROW 0: DISTOGRAMS ---
+        
+        # 1. Target Distogram
+        im0 = axes[0, 0].imshow(true_disto, cmap='viridis_r', aspect='auto')
+        
+        # Add Horizontal Colorbar to the TOP
+        div0 = make_axes_locatable(axes[0, 0])
+        cax0 = div0.append_axes("top", size="5%", pad=0.15)
+        cb0 = fig.colorbar(im0, cax=cax0, orientation="horizontal")
+        
+        # Move ticks to top so they don't overlap the plot, and use label as the Title
+        cb0.ax.xaxis.set_ticks_position('top')
+        cb0.ax.xaxis.set_label_position('top')
+        cb0.set_label("True Global Topology (Target)", fontweight='bold')
+        
+        # 2. Predicted Distogram
+        im1 = axes[0, 1].imshow(pred_disto, cmap='viridis_r', aspect='auto')
+        
+        div1 = make_axes_locatable(axes[0, 1])
+        cax1 = div1.append_axes("top", size="5%", pad=0.15)
+        cb1 = fig.colorbar(im1, cax=cax1, orientation="horizontal")
+        
+        cb1.ax.xaxis.set_ticks_position('top')
+        cb1.ax.xaxis.set_label_position('top')
+        cb1.set_label("Predicted Global Topology", fontweight='bold')
+        
+        # --- ROW 1: SECONDARY STRUCTURE ---
+        
+        ss_cmap = ListedColormap(['#ff6666', '#66b3ff', '#e0e0e0'])
+        ss_comparison = np.vstack((true_ss, pred_ss))
+        
+        legend_elements = [
+            mpatches.Patch(color='#ff6666', label='Helix'),
+            mpatches.Patch(color='#66b3ff', label='Sheet'),
+            mpatches.Patch(color='#e0e0e0', label='Loop')
+        ]
+        
+        # 3. Left SS Plot (Target Column)
+        axes[1, 0].imshow(ss_comparison, cmap=ss_cmap, aspect='auto', vmin=0, vmax=2)
+        axes[1, 0].set_yticks([0, 1])
+        axes[1, 0].set_yticklabels(["True", "Pred"], fontsize=8)
+        axes[1, 0].set_xlabel("Sequence Position")
+        
+        # 4. Right SS Plot (Predicted Column)
+        axes[1, 1].imshow(ss_comparison, cmap=ss_cmap, aspect='auto', vmin=0, vmax=2)
+        axes[1, 1].set_yticks([0, 1])
+        axes[1, 1].set_yticklabels(["True", "Pred"], fontsize=8)
+        axes[1, 1].set_xlabel("Sequence Position")
+        
+        # Attach the legend directly to the right side of the bottom-right plot.
+        # Because we aren't squeezing the top row anymore, this won't break the layout.
+        axes[1, 1].legend(handles=legend_elements, loc='center left', bbox_to_anchor=(1.02, 0.5), 
+                          fontsize=8, frameon=False)
+        
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=150)
+        plt.close()
+        
+    else:
+        # Fallback 1x2 plot
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        
+        im0 = axes[0].imshow(true_disto, cmap='viridis_r', aspect='auto')
+        div0 = make_axes_locatable(axes[0])
+        cax0 = div0.append_axes("top", size="5%", pad=0.15)
+        cb0 = fig.colorbar(im0, cax=cax0, orientation="horizontal")
+        cb0.ax.xaxis.set_ticks_position('top')
+        cb0.ax.xaxis.set_label_position('top')
+        cb0.set_label("True Global Topology (Target)", fontweight='bold')
+        
+        im1 = axes[1].imshow(pred_disto, cmap='viridis_r', aspect='auto')
+        div1 = make_axes_locatable(axes[1])
+        cax1 = div1.append_axes("top", size="5%", pad=0.15)
+        cb1 = fig.colorbar(im1, cax=cax1, orientation="horizontal")
+        cb1.ax.xaxis.set_ticks_position('top')
+        cb1.ax.xaxis.set_label_position('top')
+        cb1.set_label("Predicted Global Topology", fontweight='bold')
+        
+        plt.tight_layout()
+        plt.savefig(save_path)
+        plt.close()
 
 
 def set_seed(seed):
@@ -172,47 +269,73 @@ def angles_to_3d_coords_memory_safe(pred_1d, sequences, device):
 
 import torch
 
-def compute_contiguous_drmsd(pred_ca, target_ca, dssp_string):
+def compute_contiguous_drmsd(pred_ca, target_ca, target_ss, valid_mask, helix_idx=0, sheet_idx=1):
     """
-    Evaluates pure local secondary structure by computing dRMSD only 
-    WITHIN individual, contiguous blocks of Helices or Sheets.
+    Evaluates local secondary structure distance MAE within contiguous blocks.
+    Universally compatible with both Training (Tensors) and Evaluation (NumPy).
+    Expects single-protein inputs (no batch dimension).
     """
-    # ==========================================
-    # [THE FIX]: Automatically convert NumPy arrays to PyTorch Tensors
-    # ==========================================
+    # 1. Universally convert inputs to PyTorch Tensors
     if isinstance(pred_ca, np.ndarray):
-        pred_ca = torch.from_numpy(pred_ca).float()
+        pred_ca = torch.from_numpy(pred_ca)
     if isinstance(target_ca, np.ndarray):
-        target_ca = torch.from_numpy(target_ca).float()
-    # ==========================================
+        target_ca = torch.from_numpy(target_ca)
+    if isinstance(target_ss, np.ndarray):
+        target_ss = torch.from_numpy(target_ss)
+    if isinstance(valid_mask, np.ndarray):
+        valid_mask = torch.from_numpy(valid_mask)
+        
+    # 2. Align devices and types (safeguard for training loop)
+    device = pred_ca.device
+    pred_ca = pred_ca.float()
+    target_ca = target_ca.to(device).float()
+    target_ss = target_ss.to(device).long()
+    valid_mask = valid_mask.to(device).bool()
 
-    dssp_string = dssp_string[:pred_ca.shape[0]]
-
+    # 3. Truncate to sequence length
     L = pred_ca.shape[0]
+    target_ss = target_ss[:L]
+    valid_mask = valid_mask[:L]
 
-    def get_blocks(valid_chars):
-        """Finds all contiguous blocks of matching characters."""
+    # 4. Full Sequence dRMSD
+    valid_idx_full = torch.where(valid_mask)[0]
+    if len(valid_idx_full) > 0:
+        p_sub = pred_ca[valid_idx_full]
+        t_sub = target_ca[valid_idx_full]
+        full_err = torch.abs(torch.cdist(p_sub, p_sub) - torch.cdist(t_sub, t_sub)).sum().item()
+        full_drmsd = full_err / (len(valid_idx_full) ** 2)
+    else:
+        full_drmsd = float('nan')
+
+    # 5. Extract blocks safely using lists (fastest for sequential iteration)
+    def get_blocks(class_idx):
         blocks = []
-        current_block = []
-        for i, char in enumerate(dssp_string):
-            if char in valid_chars:
-                current_block.append(i)
+        curr = []
+        # Move to CPU for fast python loop iteration
+        ts_list = target_ss.cpu().tolist()
+        vm_list = valid_mask.cpu().tolist()
+        
+        for i, (val, is_valid) in enumerate(zip(ts_list, vm_list)):
+            if val == class_idx and is_valid:
+                curr.append(i)
             else:
-                if len(current_block) > 3: # Must be at least 4 residues
-                    blocks.append(current_block)
-                current_block = []
-        if len(current_block) > 3:
-            blocks.append(current_block)
+                if len(curr) >= 4:  # Must be at least 4 residues to form a meaningful structure
+                    blocks.append(curr)
+                curr = []
+        if len(curr) >= 4:
+            blocks.append(curr)
         return blocks
 
+    # 6. Evaluate blocks dynamically on the GPU
     def evaluate_blocks(blocks):
-        if not blocks: return 0.0
-        
+        if not blocks: 
+            return float('nan') # Safe for both np.nanmean and PyTorch logging
+            
         total_error = 0.0
         total_pairs = 0
         
         for block in blocks:
-            idx = torch.tensor(block, device=pred_ca.device)
+            idx = torch.tensor(block, device=device)
             p_sub = pred_ca[idx]
             t_sub = target_ca[idx]
             
@@ -220,19 +343,16 @@ def compute_contiguous_drmsd(pred_ca, target_ca, dssp_string):
             t_dist = torch.cdist(t_sub, t_sub)
             
             error = torch.abs(p_dist - t_dist)
-            
             total_error += error.sum().item()
             total_pairs += error.numel()
             
-        return total_error / total_pairs if total_pairs > 0 else 0.0
+        return total_error / total_pairs if total_pairs > 0 else float('nan')
 
-    helix_chars = ['H', 'G', 'I']
-    sheet_chars = ['E', 'B']
-
-    helix_blocks = get_blocks(helix_chars)
-    sheet_blocks = get_blocks(sheet_chars)
+    helix_blocks = get_blocks(helix_idx)
+    sheet_blocks = get_blocks(sheet_idx)
 
     return {
+        'full_drmsd': full_drmsd,
         'intra_helix_drmsd': evaluate_blocks(helix_blocks),
         'intra_sheet_drmsd': evaluate_blocks(sheet_blocks),
         'helix_count': len(helix_blocks),
@@ -267,22 +387,36 @@ def main():
         lr=float(train_cfg.get("lr", 3e-4)), 
         weight_decay=1e-4
     )
-
-    warmup_steps = train_cfg.get("warmup_steps", 2000)
-    estimated_steps_per_epoch = train_cfg.get("estimated_steps_per_epoch", 1000) 
-    total_steps = train_cfg.get("steps", 10000)
+    
+    accumulation_steps = cfg.get("training", {}).get("accumulation_steps", 1)
+    checkpoint_interval = train_cfg.get("checkpoint_interval", 1000) 
+    warmup_steps = train_cfg.get("warmup_steps", 2000) // accumulation_steps
+    decay_steps = train_cfg.get("decay_steps", 8000) // accumulation_steps
+    min_lr_ratio = train_cfg.get("min_lr_ratio", 0.1) 
+    total_steps = train_cfg.get("total_steps", 10000)
 
     def lr_schedule_fn(step):
-        if step < warmup_steps: return float(step) / float(max(1, warmup_steps))
-        progress = min(1.0, float(step - warmup_steps) / float(max(1, total_steps - warmup_steps)))
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
+        # 1. Linear Warmup Phase
+        if step < warmup_steps: 
+            return float(step) / float(max(1, warmup_steps))
+            
+        # 2. Long Tail Phase (Hold steady at the minimum)
+        if step >= decay_steps:
+            return min_lr_ratio
+            
+        # 3. Cosine Decay Phase (Between warmup and decay_steps)
+        progress = float(step - warmup_steps) / float(max(1, decay_steps - warmup_steps))
+        
+        # Standard cosine decay from 1.0 to 0.0
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        
+        # Scale the decay so it bottoms out at min_lr_ratio instead of 0.0
+        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn)
     
     loader = build_loader(cfg)
-    infinite_loader = get_infinite_batches(loader) 
-    
-    scaler = torch.amp.GradScaler('cuda')
+    infinite_loader = get_infinite_batches(loader)
 
     # [FIX]: Only need to set the unified model to train
     model.train()
@@ -290,22 +424,49 @@ def main():
     lambda_3d_base = as_float(cfg.get("loss", {}).get("lambda_3d", 1.0), 1.0)
     lambda_dist_1d = as_float(cfg.get("loss", {}).get("lambda_distance", 1.0), 1.0)
     lambda_ss = as_float(cfg.get("loss", {}).get("lambda_ss", 0.5), 0.5)
+    lambda_disto = as_float(cfg.get("loss", {}).get("lambda_disto", 0.5), 0.5)
+    lambda_rog = as_float(cfg.get("loss", {}).get("lambda_rog", 0.5), 0.5)
+
     warmup_steps_3d = as_int(cfg.get("training", {}).get("warmup_steps_3d", 500), 500)
     warmup_steps_band_mask = as_int(cfg.get("training", {}).get("warmup_steps_band_mask", 500), 500)
     max_band_mask_size = as_int(cfg.get("training", {}).get("max_band_mask_size", 30), 30)
 
-    accumulation_steps = cfg.get("training", {}).get("accumulation_steps", 1)
     optimizer.zero_grad(set_to_none=True)
+
+    start_step = 0
+    resume_from_checkpoint = cfg.get("training", {}).get("resume_from_checkpoint", True)
+    ckpt_path = cfg.get("training", {}).get("checkpoint_path", "checkpoints/phase1_full_mini.pt")
+    
+    if resume_from_checkpoint and os.path.exists(ckpt_path):
+        print(f"[INFO] Found checkpoint at {ckpt_path}. Resuming training...")
+        ckpt = torch.load(ckpt_path, map_location=device)
+        
+        # Restore all states
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        
+        if "scheduler" in ckpt and ckpt["scheduler"] is not None and scheduler is not None:
+            scheduler.load_state_dict(ckpt["scheduler"])
+            
+        # Get the step to resume from
+        start_step = ckpt.get("step", 0)
+        print(f"[INFO] Successfully restored all states. Resuming from step {start_step}.")
+    else:
+        print(f"[INFO] No checkpoint found at {ckpt_path}. Starting from scratch.")
 
     average_loss = 0.0
     average_mse_loss = 0.0
     average_dist_loss = 0.0
     average_3d_loss = 0.0
-    average_ss_loss = 0.0  # <-- FIX: Initialize here before the loop
+    average_ss_loss = 0.0
+    average_disto_loss = 0.0
+    average_rog_loss = 0.0
 
-    for step in range(total_steps):
-        current_lambda_3d = min(1.0, step / warmup_steps_3d * accumulation_steps) * lambda_3d_base
-        current_band_mask_size = min(max_band_mask_size, int(max_band_mask_size * (step / (warmup_steps_band_mask * accumulation_steps))))
+    for step in range(start_step, total_steps):
+        current_lambda_3d = min(1.0, step / warmup_steps_3d) * lambda_3d_base
+        current_lambda_disto = min(1.0, step / warmup_steps_3d) * lambda_disto
+        current_lambda_rog = min(1.0, step / warmup_steps_3d) * lambda_rog
+        current_band_mask_size = min(max_band_mask_size, int(max_band_mask_size * (step / warmup_steps_band_mask)))
         
         batch = next(infinite_loader)
         
@@ -319,17 +480,18 @@ def main():
         target_ss = batch["target_ss"].to(device, non_blocking=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            pred_1d, ss_logits = model(tokens, src_key_padding_mask=padding_mask)
-            
+            pred_1d, ss_logits, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
+
         pred_1d = pred_1d.float()
         ss_logits = ss_logits.float()
+        disto_logits = disto_logits.float()
         
         pred_1d_for_3d = pred_1d.clone()
         pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
         
         pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
         
-        loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss = end_to_end_loss(
+        loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss, loss_disto, loss_rog, target_pdists = end_to_end_loss(
             pred_1d=pred_1d, 
             target_angles=angles,
             target_distances=distances,
@@ -337,9 +499,12 @@ def main():
             target_coords=target_coords,
             ss_logits=ss_logits,      
             target_ss=target_ss,      
+            disto_logits=disto_logits,
             lambda_dist=lambda_dist_1d,
             lambda_3d=current_lambda_3d,
             lambda_ss=lambda_ss,            
+            lambda_disto=current_lambda_disto,
+            lambda_rog=current_lambda_rog,
             mask_1d=mask_1d,
             mask_3d=mask_3d,
             band_mask_size=current_band_mask_size
@@ -350,6 +515,8 @@ def main():
         average_dist_loss += mse_dist_1d.item()
         average_3d_loss += loss_3d.item()
         average_ss_loss += loss_ss.item()
+        average_disto_loss += loss_disto.item()
+        average_rog_loss += loss_rog.item()
 
         loss_total = loss_total / accumulation_steps
 
@@ -366,24 +533,53 @@ def main():
         if step % 100 == 0:
             current_lr = scheduler.get_last_lr()[0]
             print(f"step={step:5d} lr={current_lr:.6f} loss={average_loss / 100:.4f} "
-                  f"[trig={average_mse_loss / 100:.4f} dist1D={average_dist_loss / 100:.4f} dRMSD_3D={average_3d_loss / 100:.4f} ss={average_ss_loss / 100:.4f}]")
+                  f"[trig={average_mse_loss / 100:.4f}/{average_mse_loss / 100:.4f} dist1D={average_dist_loss / 100:.4f}/{average_dist_loss*lambda_dist_1d/100:.4f} dRMSD_3D={average_3d_loss / 100:.4f}/{average_3d_loss*current_lambda_3d/100:.4f} ss={average_ss_loss / 100:.4f}/{average_ss_loss*lambda_ss/100:.4f} disto={average_disto_loss / 100:.4f}/{average_disto_loss*current_lambda_disto/100:.4f} rog={average_rog_loss / 100:.4f}/{average_rog_loss*current_lambda_rog/100:.4f}]")
             
             viz_index = 0
             valid_len = int(mask_1d[viz_index].sum().item())
             
             true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
-            pred_valid = pred_coords[viz_index, :valid_len].cpu().detach().numpy()
-
-            dssp_str = batch["dssp_strs"][viz_index] 
+            pred_valid = pred_coords[viz_index, :valid_len].cpu().detach().numpy() 
 
             metrics = compute_contiguous_drmsd(
                 pred_ca=pred_valid, 
                 target_ca=true_valid, 
-                dssp_string=dssp_str
+                target_ss=target_ss[viz_index, :valid_len].cpu().numpy(),
+                valid_mask=mask_1d[viz_index, :valid_len].cpu().numpy()
             )
 
             print(f"Diagnostics -> Helix Error: {metrics['intra_helix_drmsd']:.2f}A | "
                 f"Sheet Error: {metrics['intra_sheet_drmsd']:.2f}A | ")
+            
+            if disto_logits is not None:
+                # 1. Distogram Prep (Expected Value)
+                probs = F.softmax(disto_logits[viz_index, :valid_len, :valid_len].detach(), dim=-1)
+                bin_indices = torch.arange(64, device=probs.device).float()
+                expected_bins = (probs * bin_indices).sum(dim=-1).cpu().numpy()
+                
+                viz_target_pdists = target_pdists[viz_index, :valid_len, :valid_len].detach()
+                true_bins = torch.floor((viz_target_pdists - 2.0) / (22.0 - 2.0) * 64).long()
+                true_bins = torch.clamp(true_bins, min=0, max=63).cpu().numpy()
+                
+                # ==========================================
+                # 2. [NEW] Secondary Structure Prep
+                # ==========================================
+                # Get True SS (shape: [L])
+                viz_true_ss = target_ss[viz_index, :valid_len].cpu().numpy()
+                
+                # Get Predicted SS (shape: [L]) by taking the argmax over the 3 classes
+                viz_pred_ss = ss_logits[viz_index, :valid_len].detach().argmax(dim=-1).cpu().numpy()
+                
+                # 3. Save the Plot
+                disto_save_path = f"outputs/full_eval/disto_step_{step:06d}.png"
+                
+                plot_distograms(
+                    pred_disto=expected_bins, 
+                    true_disto=true_bins, 
+                    pred_ss=viz_pred_ss, 
+                    true_ss=viz_true_ss, 
+                    save_path=disto_save_path
+                )
 
             plot_protein_comparison(
                 true_coords=true_valid, 
@@ -396,14 +592,31 @@ def main():
             average_mse_loss = 0.0
             average_dist_loss = 0.0
             average_3d_loss = 0.0
-            average_ss_loss = 0.0  # <-- FIX: Reset the accumulator here too
+            average_ss_loss = 0.0
+            average_disto_loss = 0.0
+            average_rog_loss = 0.0
 
-        if (step + 1) % estimated_steps_per_epoch == 0:
+        if (step + 1) % checkpoint_interval == 0:
             ckpt_path = train_cfg.get("checkpoint_path", f"checkpoints/phase1_step_{step + 1}.pt")
             os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            # [FIX]: Only save the unified model state
-            torch.save({"model": model.state_dict(), "config": cfg}, ckpt_path)
-            print(f"saved checkpoint: {ckpt_path}")
+            
+            # 1. Pack the complete training state
+            checkpoint_state = {
+                "step": step + 1,
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler else None,
+                "config": cfg
+            }
+
+            # 2. Atomic Save (Write to a .tmp file first)
+            temp_path = ckpt_path + ".tmp"
+            torch.save(checkpoint_state, temp_path)
+            
+            # 3. Atomically overwrite the main file
+            os.replace(temp_path, ckpt_path)
+            
+            print(f"[INFO] Saved robust training checkpoint: {ckpt_path}")
 
 if __name__ == "__main__":
     main()

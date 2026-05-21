@@ -1,7 +1,6 @@
 import torch
 import torch.nn.functional as F
 
-
 def safe_cdist(x, y, eps=1e-8):
     """Computes pairwise distance avoiding NaN gradients at exactly 0."""
     # [FIX 2]: Adds epsilon before sqrt to prevent division by zero in backward pass
@@ -10,12 +9,31 @@ def safe_cdist(x, y, eps=1e-8):
     return torch.sqrt(sq_dist + eps)
 
 
+def radius_of_gyration_loss(pred_coords, target_coords, mask_1d):
+    """Computes the Scale-Invariant (Logarithmic) Radius of Gyration loss."""
+    valid_lens = mask_1d.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-8 
+    
+    pred_cog = (pred_coords * mask_1d.unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_lens
+    target_cog = (target_coords * mask_1d.unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_lens
+    
+    pred_sq_dist = ((pred_coords - pred_cog) ** 2).sum(dim=-1) 
+    target_sq_dist = ((target_coords - target_cog) ** 2).sum(dim=-1)
+    
+    pred_rg2 = (pred_sq_dist * mask_1d).sum(dim=1) / valid_lens.squeeze(-1).squeeze(-1)
+    target_rg2 = (target_sq_dist * mask_1d).sum(dim=1) / valid_lens.squeeze(-1).squeeze(-1)
+    
+    pred_rg = torch.sqrt(pred_rg2 + 1e-8)
+    target_rg = torch.sqrt(target_rg2 + 1e-8)
+    
+    return F.mse_loss(torch.log(pred_rg), torch.log(target_rg))
+
+
 def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, target_coords, 
-                    ss_logits=None, target_ss=None, 
-                    lambda_dist=1.0, lambda_3d=1.0, lambda_ss=0.5, 
+                    ss_logits=None, target_ss=None, disto_logits=None, 
+                    lambda_dist=1.0, lambda_3d=1.0, lambda_ss=0.5, lambda_disto=0.5, lambda_rog=0.5, 
                     mask_1d=None, mask_3d=None, mask=None, band_mask_size=30):
     """
-    Computes both Local (Angle/Dist), Global (3D dRMSD), and Auxiliary (SS) losses.
+    Computes Local (Angle/Dist), Global (3D dRMSD), Auxiliary (SS), and 2D Direct Distogram losses.
     """
     B, L = target_angles.shape[0], target_angles.shape[1]
 
@@ -90,9 +108,12 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
         mse_trig = mse_trig_unreduced.mean()
         mse_dist = mse_dist_unreduced.mean()
         loss_3d = drmsd_unreduced.mean()
+        mask_2d = torch.ones_like(target_pdists)
 
+    # ==========================================
+    # 4. SECONDARY STRUCTURE AUXILIARY LOSS
+    # ==========================================
     loss_ss = torch.tensor(0.0, device=pred_1d.device)
-    
     if ss_logits is not None and target_ss is not None:
         target_ss_masked = target_ss.clone()
         if mask_1d is not None:
@@ -106,7 +127,67 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
                 label_smoothing=0.1
             )
 
-    # Combine Local, Global, and Auxiliary losses
-    total_loss = mse_trig + (lambda_dist * mse_dist) + (lambda_3d * loss_3d) + (lambda_ss * loss_ss)
+    # ==========================================
+    # 5. DIRECT 2D DISTOGRAM LOSS (Targeted Continuous Weights)
+    # ==========================================
+    loss_disto = torch.tensor(0.0, device=pred_1d.device)
+    if disto_logits is not None:
+        num_bins = 64
+        # Uniformly bin target distances between 2.0A and 22.0A
+        target_bins = torch.floor((target_pdists - 2.0) / (22.0 - 2.0) * num_bins).long()
+        target_bins = torch.clamp(target_bins, min=0, max=num_bins - 1)
+        
+        # Apply the exact same active curriculum band mask
+        target_bins_masked = target_bins.clone()
+        target_bins_masked[mask_2d == 0] = -100 # Standard Cross-Entropy ignore index
+        
+        if (target_bins_masked != -100).any():
+            B, L, _ = target_bins_masked.shape
+            
+            # 1. Calculate Unreduced Loss [B, L, L]
+            raw_disto_loss = F.cross_entropy(
+                disto_logits.permute(0, 3, 1, 2), 
+                target_bins_masked, 
+                ignore_index=-100,
+                reduction='none' 
+            )
+            
+            # 2. Continuous Sequence Separation Math
+            seq_idx = torch.arange(L, device=raw_disto_loss.device)
+            seq_separation = torch.abs(seq_idx.unsqueeze(0) - seq_idx.unsqueeze(1)).float() 
+            seq_separation = seq_separation.unsqueeze(0) # [1, L, L]
+            
+            # Base sequence weight smoothly scales from 1.0 (local) to 5.0 (long-range)
+            scaled_sep = torch.clamp(seq_separation / 100.0, min=0.0, max=1.0)
+            seq_weight = 1.0 + (5.0 - 1.0) * scaled_sep
+            
+            # 3. Surgical Masking (Fixing the Background Avalanche)
+            is_contact = target_pdists < 8.0  # Boolean mask of actual physical structure
+            
+            # Suppress the 88,000 empty background pixels so they don't dominate the loss
+            weight_matrix = torch.full_like(raw_disto_loss, 1.0) 
+            
+            # For true contacts, use the continuous sequence weight, multiplied by a boost!
+            # - A local helix contact gets ~ 1.0 * 5.0 = 5.0 weight
+            # - A distant tertiary contact gets ~ 5.0 * 5.0 = 25.0 weight
+            contact_weights = seq_weight * 5.0
+            weight_matrix = torch.where(is_contact, contact_weights, weight_matrix)
+            
+            # 4. Apply weights and calculate mean
+            weighted_loss = raw_disto_loss * weight_matrix
+            
+            valid_pixels = (target_bins_masked != -100)
+            loss_disto = weighted_loss[valid_pixels].mean()
+            
+
+    loss_rog = radius_of_gyration_loss(pred_coords, target_coords, mask_1d)
+
+    # Combine all structural representations
+    total_loss = (mse_trig + 
+                  (lambda_dist * mse_dist) + 
+                  (lambda_3d * loss_3d) + 
+                  (lambda_ss * loss_ss) + 
+                  (lambda_disto * loss_disto) +
+                  (lambda_rog * loss_rog))
     
-    return total_loss, mse_trig, mse_dist, loss_3d, loss_ss
+    return total_loss, mse_trig, mse_dist, loss_3d, loss_ss, loss_disto, loss_rog, target_pdists

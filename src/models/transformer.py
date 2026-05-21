@@ -76,7 +76,11 @@ class TwoTrack_TransformerBlock(nn.Module):
         nn.init.zeros_(self.pair_to_bias.bias)
         
         # 2. Projects the concatenated 1D states back into the 2D track dimension
-        self.outer_product_proj = nn.Linear(d_model * 2, d_pair)
+        self.pair_update_mlp = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, self.d_pair)
+        )
         
     def forward(self, x, pair_track, cos, sin, padding_mask_bool=None):
         B, L, D = x.shape
@@ -127,7 +131,7 @@ class TwoTrack_TransformerBlock(nn.Module):
         
         # Concatenate and project down to update the 2D track
         outer_concat = torch.cat([left_1d, right_1d], dim=-1)
-        pair_track = pair_track + self.outer_product_proj(outer_concat)
+        pair_track = pair_track + self.pair_update_mlp(outer_concat)
         
         return x, pair_track
 
@@ -140,9 +144,9 @@ class TransformerBackbone(nn.Module):
         # Frozen ESM-2 Embeddings
         # ==========================================
         print("[INFO] Loading frozen ESM-2 35M model...")
-        self.esm_model, self.esm_alphabet = esm.pretrained.esm2_t12_35M_UR50D()
-        self.esm_layer = 12 # Extract from the final layer of the 35M model
-        self.esm_dim = 480  
+        self.esm_model, self.esm_alphabet = esm.pretrained.esm2_t33_650M_UR50D()
+        self.esm_layer = 33 # Extract from the final layer of the 35M model
+        self.esm_dim = 1280 
         
         # Freeze the whole model first...
         for param in self.esm_model.parameters():
@@ -237,7 +241,7 @@ class TransformerBackbone(nn.Module):
                 layer, x, pair_track, cos, sin, padding_mask_bool, use_reentrant=False
             )
             
-        return x
+        return x, pair_track
 
 
 def create_local_window_mask(seq_len, window_size=16, device='cpu'):
@@ -260,12 +264,16 @@ class TrigDistanceHead(nn.Module):
     def __init__(self, d_model, hidden=128):
         super().__init__()
         
-        # 1. SS Head evaluates FIRST
-        self.ss_head = nn.Linear(d_model, 3)
+        # [UPGRADE]: Give the SS head enough non-linear capacity to actually classify
+        self.ss_head = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.LayerNorm(hidden),
+            nn.Linear(hidden, 3)
+        )
 
         # 2. Projection accepts the original hidden state PLUS the 3 SS probabilities
         self.proj = nn.Linear(d_model + 3, hidden)
-        
         self.out = nn.Linear(hidden, 5)
         
         nn.init.zeros_(self.out.weight)
@@ -274,13 +282,12 @@ class TrigDistanceHead(nn.Module):
     def forward(self, h):
         # --- STEP 1: Predict Secondary Structure ---
         ss_logits = self.ss_head(h)
-        
-        # Convert logits to stable [0, 1] probabilities for conditioning
         ss_probs = F.softmax(ss_logits, dim=-1)
         
         # --- STEP 2: Condition the Geometry on the SS ---
-        # Concatenate the d_model representations with the 3 SS probabilities
-        h_conditioned = torch.cat([h, ss_probs], dim=-1)
+        # [THE FIX]: .detach() acts as a gradient firewall. 
+        # The 3D head can read the SS probabilities, but cannot alter the SS head's weights!
+        h_conditioned = torch.cat([h, ss_probs.detach()], dim=-1)
         
         # Predict continuous geometry using the conditioned representation
         x = F.gelu(self.proj(h_conditioned))
@@ -298,8 +305,8 @@ class TrigDistanceHead(nn.Module):
 
 class ProteinFoldingNetwork(nn.Module):
     """
-    The top-level wrapper that glues the ESM/Two-Track backbone 
-    and the Trig/SS Head together.
+    The top-level wrapper that glues the ESM/Two-Track backbone, 
+    the Trig/SS Head, and the new 2D Distogram Head together.
     """
     def __init__(self, d_model=256, nhead=8, num_layers=6, d_pair=64):
         super().__init__()
@@ -310,12 +317,35 @@ class ProteinFoldingNetwork(nn.Module):
             d_pair=d_pair
         )
         self.head = TrigDistanceHead(d_model=d_model)
+
+        self.pair_to_seq = nn.Linear(d_pair, d_model)
+        
+        self.pair_norm = nn.LayerNorm(d_pair)
+        self.disto_head = nn.Sequential(
+            nn.Linear(d_pair, d_pair),
+            nn.GELU(),
+            nn.LayerNorm(d_pair),
+            nn.Linear(d_pair, 64)
+        )
         
     def forward(self, tokens, src_key_padding_mask=None):
-        # 1. Get the final 1D track hidden states from the Two-Track backbone
-        h = self.backbone(tokens, src_key_padding_mask=src_key_padding_mask)
+        # Unpack both tracks from the updated backbone
+        h, pair_track = self.backbone(tokens, src_key_padding_mask=src_key_padding_mask)
         
-        # 2. Pass hidden states to the head to get kinematics and SS logits
-        pred_1d, ss_logits = self.head(h)
+        # --- THE SYMMETRY FIX ---
+        # 1. Normalize the track (prevents gradients from exploding over many layers)
+        pair_track = self.pair_norm(pair_track)
+
+        pair_context = pair_track.mean(dim=2)
+
+        # Inject this global spatial awareness into the 1D track
+        h_spatially_aware = h + F.gelu(self.pair_to_seq(pair_context))
         
-        return pred_1d, ss_logits
+        # Predict continuous geometry and SS
+        pred_1d, ss_logits = self.head(h_spatially_aware)
+        
+        # 2. Predict logits
+        disto_logits = self.disto_head(pair_track)
+        disto_logits = (disto_logits + disto_logits.transpose(1, 2)) / 2.0
+        
+        return pred_1d, ss_logits, disto_logits

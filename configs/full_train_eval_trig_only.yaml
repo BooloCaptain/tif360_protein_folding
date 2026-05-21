@@ -20,38 +20,37 @@ model:
   d_pair: 128
 
 training:
-  resume_from_checkpoint: true
-  max_tokens: 500
+  max_tokens: 750
   megabatch_size: 10000
-  lr: 1e-4 # peak learning rate
-  min_lr_ratio: 0.001
-  total_steps: 250000
-  warmup_steps: 10000
-  decay_steps: 250000
-  warmup_steps_3d: 10000
-  warmup_steps_band_mask: 10000
+  lr: 1e-3 # peak learning rate
+  min_lr_ratio: 0.01
+  total_steps: 25000
+  warmup_steps: 2500 # multiply by accumulatioin_steps for actual warmup steps
+  decay_steps: 25000 # multiply by accumulatioin_steps for actual decay steps
+  warmup_steps_3d: 5000
+  warmup_steps_band_mask: 5000
   max_band_mask_size: 200
   checkpoint_interval: 1000
-  checkpoint_path: checkpoints/phase1_full_mini.pt
+  checkpoint_path: checkpoints/phase1_full_mini_trig_only.pt
   compile: false
-  accumulation_steps: 40
+  accumulation_steps: 25
 
 loss:
   lambda_distance: 1.0   # Keep at 1.0
   lambda_3d: 0.0         # INCREASE from 0.01
-  lambda_ss: 0.1         # DECREASE from 0.25
-  lambda_disto: 1.0      # INCREASE from 0.05
+  lambda_ss: 0.0         # DECREASE from 0.25
+  lambda_disto: 0.0      # INCREASE from 0.05
   lambda_rog: 0.0        # Keep at 0.0
 
 inference:
-  max_tokens: 1000
-  checkpoint_path: checkpoints/phase1_full_mini.pt
+  max_tokens: 1250
+  checkpoint_path: checkpoints/phase1_full_mini_trig_only.pt
 
 postproc:
   use_nerf: true
   nerf_impl: mpnerf
 
 export:
-  output_dir: outputs/full_eval
+  output_dir: outputs/full_eval_trig_only
   pdb: true
   gltf: true
