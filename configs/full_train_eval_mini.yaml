@@ -44,7 +44,7 @@ loss:
   lambda_rog: 0.0        # Keep at 0.0
 
 inference:
-  max_tokens: 1000
+  max_tokens: 750
   checkpoint_path: checkpoints/phase1_full_mini.pt
 
 postproc:

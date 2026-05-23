@@ -61,11 +61,165 @@ def calculate_tm_score(pred, target):
     return np.mean(1.0 / (1.0 + (dists / d0) ** 2))
 
 
+def calculate_top_l_half_long_contact_precision(pred_coords, target_coords, threshold=8.0, seq_sep=24):
+    """
+    Calculates the Top-L/2 Long-Range Contact Precision.
+    - Long-range: Sequence separation >= 24
+    - Contact: C-alpha distance <= 8.0 A
+    """
+    L = len(target_coords)
+    if L < seq_sep:
+        return np.nan # Not enough residues to form long-range contacts
+        
+    # Calculate pairwise distance matrices for prediction and target
+    diff_pred = pred_coords[:, None, :] - pred_coords[None, :, :]
+    dist_pred = np.linalg.norm(diff_pred, axis=-1)
+    
+    diff_tgt = target_coords[:, None, :] - target_coords[None, :, :]
+    dist_tgt = np.linalg.norm(diff_tgt, axis=-1)
+    
+    # Get upper triangle indices where sequence separation >= 24
+    i, j = np.triu_indices(L, k=seq_sep)
+    
+    if len(i) == 0:
+        return np.nan
+        
+    # Extract distances for valid long-range pairs
+    long_pred_dists = dist_pred[i, j]
+    long_tgt_dists = dist_tgt[i, j]
+    
+    # Determine how many is L/2
+    top_n = max(1, L // 2)
+    
+    # We want the TOP predicted contacts (the ones the model thinks are closest)
+    # np.argsort returns indices that sort the array from smallest distance to largest
+    sort_indices = np.argsort(long_pred_dists)
+    top_n_indices = sort_indices[:top_n]
+    
+    # Get the true distances for these exact pairs
+    top_tgt_dists = long_tgt_dists[top_n_indices]
+    
+    # Calculate precision: How many of the model's top guesses are actually <= 8.0 A?
+    true_positives = np.sum(top_tgt_dists <= threshold)
+    precision = true_positives / top_n
+    
+    return precision
+
+
+def calculate_top_l_half_long_contact_precision_2d(contact_probs, target_coords, threshold=8.0, seq_sep=24):
+    """
+    Calculates Top-L/2 precision using ONLY the 2D contact probabilities, 
+    bypassing 3D reconstruction entirely.
+    """
+    L = len(target_coords)
+    if L < seq_sep:
+        return np.nan
+
+    # 1. Get true distances to verify against
+    diff_tgt = target_coords[:, None, :] - target_coords[None, :, :]
+    dist_tgt = np.linalg.norm(diff_tgt, axis=-1)
+
+    # 2. Extract upper triangle for long-range (>= 24 sequence separation)
+    i, j = np.triu_indices(L, k=seq_sep)
+    if len(i) == 0:
+        return np.nan
+
+    # Get the network's confidence for these specific long-range pairs
+    long_contact_probs = contact_probs[i, j]
+    long_tgt_dists = dist_tgt[i, j]
+
+    # 3. Sort by network's confidence (Descending order!)
+    top_n = max(1, L // 2)
+    
+    # np.argsort sorts ascending, so [::-1] flips it to highest probability first
+    sort_indices = np.argsort(long_contact_probs)[::-1]
+    top_n_indices = sort_indices[:top_n]
+
+    # 4. Check true distances for the pairs the network was MOST confident about
+    top_tgt_dists = long_tgt_dists[top_n_indices]
+    
+    true_positives = np.sum(top_tgt_dists <= threshold)
+    precision = true_positives / top_n
+    
+    return precision
+
+
 def resolve_device(cfg_device):
     requested = str(cfg_device).lower()
     if requested.startswith("cuda") and torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def distogram_expected_angstroms(disto_logits, disto_span=20.0, disto_offset=2.0):
+    """
+    Converts distogram logits [L, L, num_bins] into expected distances [L, L] in Angstroms.
+    """
+    probs = F.softmax(disto_logits.float().detach(), dim=-1)
+    num_bins = probs.shape[-1]
+    bin_indices = torch.arange(num_bins, device=probs.device, dtype=probs.dtype)
+    expected_bins = (probs * bin_indices).sum(dim=-1)
+    return (expected_bins * (float(disto_span) / float(num_bins))) + float(disto_offset)
+
+
+def masked_torsion_refinement(
+    pred_angles,
+    expected_dists,
+    pred_ss,
+    tokens,
+    device,
+    steps=100,      # [SPEED HACK]: Dropped from 300 to 100
+    lr=0.2,         # [SPEED HACK]: Doubled the learning rate for faster convergence
+    contact_cutoff=15.0,
+    stop_threshold=0.5 # [NEW]: Early stopping threshold
+):
+    """
+    Refines NeRF torsions against distogram expected distances while freezing
+    predicted helices/sheets by masking their gradients before optimizer step.
+    Includes Early Stopping for massive speedups.
+    """
+    from src.train import angles_to_3d_coords_memory_safe
+
+    optimizable_angles = pred_angles.clone().detach().float().requires_grad_(True)
+    optimizer = torch.optim.Adam([optimizable_angles], lr=float(lr))
+
+    is_coil = (pred_ss == 2)
+    valid_pairs = (expected_dists < float(contact_cutoff)).clone()
+    torch.diagonal(valid_pairs).fill_(False)
+
+    if valid_pairs.sum() == 0:
+        return pred_angles.detach()
+
+    target_d = expected_dists[valid_pairs].detach().float()
+
+    for step in range(int(steps)):
+        optimizer.zero_grad()
+        coords = angles_to_3d_coords_memory_safe(optimizable_angles, tokens, device)[0]
+        
+        diff = coords.unsqueeze(1) - coords.unsqueeze(0)
+        current_d = torch.norm(diff + 1e-8, dim=-1)
+        
+        loss = F.mse_loss(current_d[valid_pairs], target_d)
+        
+        # ==========================================
+        # [SPEED HACK 1]: Early Stopping
+        # ==========================================
+        if loss.item() < stop_threshold:
+            # The structure has satisfied the Distogram! Terminate immediately.
+            break 
+            
+        loss.backward()
+
+        if optimizable_angles.grad is not None:
+            optimizable_angles.grad[:, ~is_coil, :] = 0.0
+
+        optimizer.step()
+        
+        # Keep the GPU sync to prevent RAM crashes
+        if (step + 1) % 50 == 0:
+            torch.cuda.synchronize()
+
+    return optimizable_angles.detach()
 
 
 def main():
@@ -112,6 +266,21 @@ def main():
         print(f"[WARNING] Checkpoint {ckpt_path} not found. Executing with random weights.")
 
     model.eval()
+
+    infer_cfg = cfg.get("inference", {})
+    torsion_refine_cfg = infer_cfg.get("torsion_refinement", {})
+    refine_enabled = bool(torsion_refine_cfg.get("enabled", True))
+    refine_steps = int(torsion_refine_cfg.get("steps", 50))
+    refine_lr = float(torsion_refine_cfg.get("lr", 0.1))
+    refine_contact_cutoff = float(torsion_refine_cfg.get("contact_cutoff", 15.0))
+    refine_disto_span = float(torsion_refine_cfg.get("disto_span", 20.0))
+    refine_disto_offset = float(torsion_refine_cfg.get("disto_offset", 2.0))
+
+    if refine_enabled:
+        print(
+            "[INFO] Torsion refinement enabled "
+            f"(steps={refine_steps}, lr={refine_lr}, cutoff={refine_contact_cutoff}A)"
+        )
     
     all_rmsds = []
     all_gdt_ts = []
@@ -121,6 +290,8 @@ def main():
     all_full_drmsds = []
     all_h_drmsds = []
     all_s_drmsds = []
+    all_top_l_long = []
+    all_top_l_long_2d = []
 
     out_cfg = cfg.get("export", {})
     out_dir = out_cfg.get("output_dir", "outputs/evaluation_results")
@@ -128,8 +299,8 @@ def main():
 
     from src.train import angles_to_3d_coords_memory_safe
 
-    print(f"\n{'Sample':<7} | {'Len':<4} | {'RMSD':<6} | {'dRMSD':<6} | {'H-dRM':<6} | {'S-dRM':<6} | {'TM-Scr':<6} | {'GDT-TS':<6} | {'Q3':<5}")
-    print("-" * 75)
+    print(f"\n{'Sample':<7} | {'Len':<4} | {'RMSD':<6} | {'dRMSD':<6} | {'H-dRM':<6} | {'S-dRM':<6} | {'TM-Scr':<6} | {'GDT-TS':<6} | {'Q3':<5} | {'T-L/2_Prec':<12} | {'T-L/2_Prec_2D':<12}")
+    print("-" * 90)
 
     total_samples_processed = 0
 
@@ -141,6 +312,16 @@ def main():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred_1d, ss_logits, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
                 pred_coords = angles_to_3d_coords_memory_safe(pred_1d, tokens, device)
+
+            expected_dists = None
+            pred_ss_labels = None
+            if refine_enabled:
+                expected_dists = distogram_expected_angstroms(
+                    disto_logits,
+                    disto_span=refine_disto_span,
+                    disto_offset=refine_disto_offset,
+                )
+                pred_ss_labels = torch.argmax(ss_logits.detach(), dim=-1)
             
             pred_1d_cpu = pred_1d.float().cpu().numpy()
             pred_coords_cpu = pred_coords.float().cpu().numpy()
@@ -155,7 +336,8 @@ def main():
             
             for b in range(B):
                 L = batch["lengths"][b]
-                
+
+                # 1. Extract raw outputs for this specific protein
                 pred_np = pred_1d_cpu[b, :L, :]
                 coords_np = pred_coords_cpu[b, :L, :]
                 target_coords_np = target_coords_cpu[b, :L, :3]
@@ -164,10 +346,34 @@ def main():
                 mask_1d = mask_1d_cpu[b, :L]
                 dssp_str = dssp_strs[b][:L]
 
+                # 2. Calculate the valid mask IMMEDIATELY
                 valid_mask = (mask_1d > 0) & ~np.isnan(target_coords_np).any(axis=1)
+
                 if valid_mask.sum() < 15:
                     total_samples_processed += 1
-                    continue 
+                    continue
+
+                # 3. [FIX 3]: Gate Refinement by length
+                # Only run the heavy optimization if the protein actually has tertiary structure!
+                if refine_enabled and valid_mask.sum() >= 50:
+                    with torch.enable_grad():
+                        refined_angles = masked_torsion_refinement(
+                            pred_angles=pred_1d[b:b+1, :L, :],
+                            expected_dists=expected_dists[b, :L, :L],
+                            pred_ss=pred_ss_labels[b, :L],
+                            tokens=tokens[b:b+1, :L],
+                            device=device,
+                            steps=refine_steps,
+                            lr=refine_lr,
+                            contact_cutoff=refine_contact_cutoff,
+                        )
+                        refined_coords = angles_to_3d_coords_memory_safe(
+                            refined_angles,
+                            tokens[b:b+1, :L],
+                            device,
+                        )[0]
+                    coords_np = refined_coords.detach().float().cpu().numpy()
+                    pred_coords_cpu[b, :L, :] = coords_np
                     
                 eval_pred_coords = coords_np[valid_mask]
                 eval_true_coords = target_coords_np[valid_mask]
@@ -180,6 +386,21 @@ def main():
                 tm_val = calculate_tm_score(aligned_pred_coords, eval_true_coords)
                 q3_val = np.mean(ss_pred_labels[valid_mask] == target_ss[valid_mask])
 
+                top_l_prec = calculate_top_l_half_long_contact_precision(eval_pred_coords, eval_true_coords)
+                viz_disto_logits = disto_logits[b, :L, :L]
+                
+                # 2. Convert to probabilities (Using your .float() fix!)
+                viz_probs = F.softmax(viz_disto_logits.float(), dim=-1).detach().cpu().numpy()
+                
+                # 3. Sum the probabilities of Bins 0-19 (representing 2.0A to 8.0A)
+                # This squashes the 64 bins down into a single [L, L] matrix of contact confidence
+                contact_probs = np.sum(viz_probs[:, :, 0:20], axis=-1)
+                
+                # 4. Calculate metric directly from the 2D probabilities (Filtered by valid_mask!)
+                top_l_prec_2d = calculate_top_l_half_long_contact_precision_2d(
+                    contact_probs=contact_probs[valid_mask][:, valid_mask], 
+                    target_coords=eval_true_coords
+                )
                 metrics = compute_contiguous_drmsd(
                     pred_ca=coords_np,           # NumPy array
                     target_ca=target_coords_np,  # NumPy array
@@ -198,9 +419,10 @@ def main():
                 all_full_drmsds.append(full_d)
                 all_h_drmsds.append(h_d)
                 all_s_drmsds.append(s_d)
-
+                all_top_l_long.append(top_l_prec)
+                all_top_l_long_2d.append(top_l_prec_2d)
                 if total_samples_processed % 50 == 0:
-                    print(f"{total_samples_processed:05d}   | {valid_mask.sum():<4} | {rmsd_val:<6.2f} | {full_d:<6.2f} | {h_d:<6.2f} | {s_d:<6.2f} | {tm_val:<6.3f} | {gdt_val:<6.4f} | {q3_val * 100:.1f}%")
+                    print(f"{total_samples_processed:05d}   | {valid_mask.sum():<4} | {rmsd_val:<6.2f} | {full_d:<6.2f} | {h_d:<6.2f} | {s_d:<6.2f} | {tm_val:<6.3f} | {gdt_val:<6.4f} | {q3_val * 100:.1f}% | {top_l_prec * 100:.1f}% | {top_l_prec_2d * 100:.1f}%")
 
                 if total_samples_processed % 1000 == 0: 
                     pred_path = os.path.join(out_dir, f"test_{total_samples_processed:05d}_pred.pdb")
@@ -218,8 +440,30 @@ def main():
                 
                 total_samples_processed += 1
 
+    # ... (After total_samples_processed += 1 and breaking out of the loop)
+
+    # ==========================================
+    # [NEW] Filtered Top-L/2 Aggregation (3D and 2D)
+    # ==========================================
+    lengths_np = np.array(all_lengths)
+    top_l_np_3d = np.array(all_top_l_long)     # The 3D NeRF metric
+    top_l_np_2d = np.array(all_top_l_long_2d)  # The 2D Distogram metric
+
+    # Standard CASP Threshold: Only evaluate long-range contacts on proteins L >= 50
+    tertiary_threshold_mask = lengths_np >= 50
+    
+    if tertiary_threshold_mask.sum() > 0:
+        # Calculate mean ONLY for proteins long enough to have real tertiary structure
+        true_mean_top_l_3d = np.nanmean(top_l_np_3d[tertiary_threshold_mask])
+        true_mean_top_l_2d = np.nanmean(top_l_np_2d[tertiary_threshold_mask])
+    else:
+        true_mean_top_l_3d = np.nan
+        true_mean_top_l_2d = np.nan
+
     print("\n" + "="*45 + "\nFINAL EVALUATION SUMMARY STATISTICS\n" + "="*45)
     print(f"Total Evaluated Proteins:       {len(all_rmsds)}")
+    print(f"Proteins L >= 50 (Tertiary):    {tertiary_threshold_mask.sum()}")
+    print("-" * 45)
     print(f"Mean Global RMSD:               {np.mean(all_rmsds):.3f} Å")
     print(f"Mean Full sequence dRMSD:       {np.nanmean(all_full_drmsds):.3f} Å")
     print(f"Mean Intra-Helix dRMSD:         {np.nanmean(all_h_drmsds):.3f} Å")
@@ -227,6 +471,11 @@ def main():
     print(f"Mean Dataset GDT-TS:            {np.mean(all_gdt_ts):.4f}")
     print(f"Mean Dataset TM-Score:          {np.mean(all_tm_scores):.4f}")
     print(f"Mean Dataset Q3 SS Accuracy:    {np.mean(all_q3_accs)*100:.2f}%")
+    print("-" * 45)
+    # Print the FILTERED means here!
+    print(f"Top-L/2 Long Prec (3D NeRF):    {true_mean_top_l_3d*100:.2f}% (Proteins L>=50)")
+    print(f"Top-L/2 Long Prec (2D Disto):   {true_mean_top_l_2d*100:.2f}% (Proteins L>=50)")
+    print("=" * 45)
 
     csv_path = os.path.join(out_dir, "evaluation_metrics_summary.csv")
     with open(csv_path, "w", newline="") as f:
@@ -234,7 +483,7 @@ def main():
         writer.writerow([
             "Sample_ID", "Valid_Length", "RMSD_Angstroms", 
             "Full_dRMSD", "Helix_dRMSD", "Sheet_dRMSD", 
-            "GDT_TS", "TM_Score", "Q3_Accuracy"
+            "GDT_TS", "TM_Score", "Q3_Accuracy", "Top-L/2_Prec_3D", "Top-L/2_Prec_2D"
         ])
         for i in range(len(all_rmsds)):
             writer.writerow([
@@ -245,7 +494,10 @@ def main():
                 f"{all_s_drmsds[i]:.4f}", 
                 f"{all_gdt_ts[i]:.4f}", 
                 f"{all_tm_scores[i]:.4f}", 
-                f"{all_q3_accs[i]:.4f}"
+                f"{all_q3_accs[i]:.4f}", 
+                # Write the RAW individual values to the CSV so you have the full data
+                f"{all_top_l_long[i]:.4f}",
+                f"{all_top_l_long_2d[i]:.4f}"
             ])
     print(f"[INFO] Saved full metrics dataset to {csv_path}")
 

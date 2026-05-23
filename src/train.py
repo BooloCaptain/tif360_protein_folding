@@ -11,8 +11,7 @@ from src.postproc.visualize import kabsch_align, plot_protein_comparison
 from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.data.batching import MaxTokensBatchSampler
-from src.models.transformer import ProteinFoldingNetwork, TransformerBackbone
-from src.models.heads import TrigDistanceHead
+from src.models.transformer import ProteinFoldingNetwork
 from src.losses.torch_trig_loss import end_to_end_loss
 
 import matplotlib.pyplot as plt
