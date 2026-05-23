@@ -367,8 +367,6 @@ def main():
     torch.set_float32_matmul_precision('high') # TF32 Speedup
 
     model_cfg = cfg.get("model", {})
-
-    # [FIX]: Initialize the unified network
     model = build_model_from_cfg(model_cfg).to(device)
 
     if cfg.get("compile", False):
@@ -376,17 +374,19 @@ def main():
 
     train_cfg = cfg.get("training", {})
     
-    # [FIX]: Optimizer only needs to track model.parameters() now
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=float(train_cfg.get("lr", 3e-4)), 
-        weight_decay=1e-4
+        weight_decay=1e-4,
+        fused=True
     )
     
     accumulation_steps = cfg.get("training", {}).get("accumulation_steps", 1)
     checkpoint_interval = train_cfg.get("checkpoint_interval", 1000) 
-    warmup_steps = train_cfg.get("warmup_steps", 2000) // accumulation_steps
-    decay_steps = train_cfg.get("decay_steps", 8000) // accumulation_steps
+    logging_interval = train_cfg.get("logging_interval", 100) 
+
+    warmup_steps = train_cfg.get("warmup_steps", 2000) 
+    decay_steps = train_cfg.get("decay_steps", 8000) 
     min_lr_ratio = train_cfg.get("min_lr_ratio", 0.1) 
     total_steps = train_cfg.get("total_steps", 10000)
 
@@ -399,13 +399,9 @@ def main():
         if step >= decay_steps:
             return min_lr_ratio
             
-        # 3. Cosine Decay Phase (Between warmup and decay_steps)
+        # 3. Cosine Decay Phase
         progress = float(step - warmup_steps) / float(max(1, decay_steps - warmup_steps))
-        
-        # Standard cosine decay from 1.0 to 0.0
         cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-        
-        # Scale the decay so it bottoms out at min_lr_ratio instead of 0.0
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
     
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_schedule_fn)
@@ -413,7 +409,6 @@ def main():
     loader = build_loader(cfg)
     infinite_loader = get_infinite_batches(loader)
 
-    # [FIX]: Only need to set the unified model to train
     model.train()
 
     lambda_3d_base = as_float(cfg.get("loss", {}).get("lambda_3d", 1.0), 1.0)
@@ -428,7 +423,9 @@ def main():
 
     optimizer.zero_grad(set_to_none=True)
 
-    start_step = 0
+    global_step = 0
+    total_tokens_seen = 0
+    
     resume_from_checkpoint = cfg.get("training", {}).get("resume_from_checkpoint", True)
     ckpt_path = cfg.get("training", {}).get("checkpoint_path", "checkpoints/phase1_full_mini.pt")
     
@@ -436,18 +433,19 @@ def main():
         print(f"[INFO] Found checkpoint at {ckpt_path}. Resuming training...")
         ckpt = torch.load(ckpt_path, map_location=device)
         
-        # Restore all states
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         
         if "scheduler" in ckpt and ckpt["scheduler"] is not None and scheduler is not None:
             scheduler.load_state_dict(ckpt["scheduler"])
             
-        # Get the step to resume from
-        start_step = ckpt.get("step", 0)
-        print(f"[INFO] Successfully restored all states. Resuming from step {start_step}.")
+        # Restore trackers
+        global_step = ckpt.get("global_step", ckpt.get("step", 0))
+        total_tokens_seen = ckpt.get("total_tokens_seen", 0)
+        
+        print(f"[INFO] Resuming from Global Step {global_step} | Tokens Seen: {total_tokens_seen / 1e6:.2f}M")
     else:
-        print(f"[INFO] No checkpoint found at {ckpt_path}. Starting from scratch.")
+        print(f"[INFO] No checkpoint found. Starting from scratch.")
 
     average_loss = 0.0
     average_mse_loss = 0.0
@@ -456,10 +454,14 @@ def main():
     average_ss_loss = 0.0
     average_disto_loss = 0.0
 
-    for step in range(start_step, total_steps):
-        current_lambda_3d = min(1.0, step / warmup_steps_3d) * lambda_3d_base
-        current_lambda_disto = min(1.0, step / warmup_steps_3d) * lambda_disto
-        current_band_mask_size = min(max_band_mask_size, int(max_band_mask_size * (step / warmup_steps_band_mask)))
+    batch_idx = 0
+
+    # [FIX 3]: Train based on GLOBAL steps, not batch iterations
+    while global_step < total_steps:
+        # Curriculum learning is now locked to the global step
+        current_lambda_3d = min(1.0, global_step / max(1, warmup_steps_3d)) * lambda_3d_base
+        current_lambda_disto = min(1.0, global_step / max(1, warmup_steps_3d)) * lambda_disto
+        current_band_mask_size = min(max_band_mask_size, int(max_band_mask_size * (global_step / max(1, warmup_steps_band_mask))))
         
         batch = next(infinite_loader)
         
@@ -472,38 +474,39 @@ def main():
         target_coords = batch["coords"].to(device, non_blocking=True)
         target_ss = batch["target_ss"].to(device, non_blocking=True)
 
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        # [NEW]: Track total physical data processed
+        valid_tokens_in_batch = mask_1d.sum().item()
+        total_tokens_seen += int(valid_tokens_in_batch)
+
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
             pred_1d, ss_logits, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
+            
+            if use_3d:
+                pred_1d_for_3d = pred_1d.clone()
+                pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
+                pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
+            else:
+                pred_coords = None
+            
+            loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss, loss_disto, target_pdists = end_to_end_loss(
+                pred_1d=pred_1d, 
+                target_angles=angles,
+                target_distances=distances,
+                pred_coords=pred_coords,
+                target_coords=target_coords,
+                ss_logits=ss_logits,      
+                target_ss=target_ss,      
+                disto_logits=disto_logits,
+                lambda_dist=lambda_dist_1d,
+                lambda_3d=current_lambda_3d,
+                lambda_ss=lambda_ss,            
+                lambda_disto=current_lambda_disto,
+                mask_1d=mask_1d,
+                mask_3d=mask_3d,
+                band_mask_size=current_band_mask_size
+            )
 
-        pred_1d = pred_1d.float()
-        ss_logits = ss_logits.float()
-        disto_logits = disto_logits.float()
-        
-        if use_3d:
-            pred_1d_for_3d = pred_1d.clone()
-            pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
-            pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
-        else:
-            pred_coords = None
-        
-        loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss, loss_disto, target_pdists = end_to_end_loss(
-            pred_1d=pred_1d, 
-            target_angles=angles,
-            target_distances=distances,
-            pred_coords=pred_coords,
-            target_coords=target_coords,
-            ss_logits=ss_logits,      
-            target_ss=target_ss,      
-            disto_logits=disto_logits,
-            lambda_dist=lambda_dist_1d,
-            lambda_3d=current_lambda_3d,
-            lambda_ss=lambda_ss,            
-            lambda_disto=current_lambda_disto,
-            mask_1d=mask_1d,
-            mask_3d=mask_3d,
-            band_mask_size=current_band_mask_size
-        )
-
+        # Accumulate RAW loss values for accurate logging
         average_loss += loss_total.item()
         average_mse_loss += mse_trig.item()
         average_dist_loss += mse_dist_1d.item()
@@ -511,112 +514,121 @@ def main():
         average_ss_loss += loss_ss.item()
         average_disto_loss += loss_disto.item()
 
-        loss_total = loss_total / accumulation_steps
+        # Scale the loss mathematically for accumulation
+        scaled_loss = loss_total / accumulation_steps
+        scaled_loss.backward()
 
-        # Because you are using bfloat16, standard backward is fine without scaling
-        loss_total.backward()
-
-        if (step + 1) % accumulation_steps == 0 or (step + 1) == total_steps:
-            # [FIX]: Gradient clipping only references model
+        # ==========================================
+        # [FIX 4]: The Global Step Trigger
+        # ==========================================
+        if (batch_idx + 1) % accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            scheduler.step()
+            scheduler.step() # Scheduler ONLY steps when the optimizer steps
             optimizer.zero_grad(set_to_none=True)
-
-        if step % 100 == 0:
-            current_lr = scheduler.get_last_lr()[0]
-            print(f"step={step:5d} lr={current_lr:.6f} loss={average_loss / 100:.4f} "
-                f"[trig={average_mse_loss / 100:.4f}/{average_mse_loss / 100:.4f} dist1D={average_dist_loss / 100:.4f}/{average_dist_loss*lambda_dist_1d/100:.4f} dRMSD_3D={average_3d_loss / 100:.4f}/{average_3d_loss*current_lambda_3d/100:.4f} ss={average_ss_loss / 100:.4f}/{average_ss_loss*lambda_ss/100:.4f} disto={average_disto_loss / 100:.4f}/{average_disto_loss*current_lambda_disto/100:.4f}]")
             
-            viz_index = 0
-            valid_len = int(mask_1d[viz_index].sum().item())
+            global_step += 1
 
-            # Validation/diagnostic path keeps explicit 3D reconstruction even if training 3D loss is disabled.
-            if pred_coords is None:
-                pred_1d_for_eval = pred_1d.clone()
-                pred_1d_for_eval[..., 4] = pred_1d_for_eval[..., 4].detach()
-                pred_coords_eval = angles_to_3d_coords_memory_safe(pred_1d_for_eval, tokens, device)
-            else:
-                pred_coords_eval = pred_coords
-            
-            true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
-            pred_valid = pred_coords_eval[viz_index, :valid_len].cpu().detach().numpy() 
+            # --- LOGGING (Every 100 Global Steps) ---
+            if global_step % logging_interval == 0:
+                average_length = valid_tokens_in_batch / mask_1d.shape[0]
+                current_lr = scheduler.get_last_lr()[0]
+                
+                # Because we accumulate over 100 global steps * accumulation_steps, 
+                # we must divide by the total number of batches to get the true average
+                log_div = 100 * accumulation_steps
+                
+                print(f"Global Step: {global_step:5d} | Tokens Seen: {total_tokens_seen / 1e6:.2f}M | "
+                      f"avg_len={average_length:.0f} | lr={current_lr:.6f} | "
+                      f"loss={average_loss / log_div:.4f} "
+                      f"[trig={average_mse_loss / log_div:.4f} "
+                      f"dist1D={average_dist_loss / log_div:.4f} "
+                      f"dRMSD_3D={average_3d_loss / log_div:.4f} "
+                      f"ss={average_ss_loss / log_div:.4f} "
+                      f"disto={average_disto_loss / log_div:.4f}]")
+                
+                # Reset accumulators
+                average_loss = 0.0
+                average_mse_loss = 0.0
+                average_dist_loss = 0.0
+                average_3d_loss = 0.0
+                average_ss_loss = 0.0
+                average_disto_loss = 0.0
+                
+                # --- VIZUALIZATION LOGIC (Using current batch) ---
+                viz_index = 0
+                valid_len = int(mask_1d[viz_index].sum().item())
 
-            metrics = compute_contiguous_drmsd(
-                pred_ca=pred_valid, 
-                target_ca=true_valid, 
-                target_ss=target_ss[viz_index, :valid_len].cpu().numpy(),
-                valid_mask=mask_1d[viz_index, :valid_len].cpu().numpy()
-            )
+                if pred_coords is None:
+                    pred_1d_for_eval = pred_1d.clone()
+                    pred_1d_for_eval[..., 4] = pred_1d_for_eval[..., 4].detach()
+                    pred_coords_eval = angles_to_3d_coords_memory_safe(pred_1d_for_eval, tokens, device)
+                else:
+                    pred_coords_eval = pred_coords
+                
+                true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
+                pred_valid = pred_coords_eval[viz_index, :valid_len].cpu().detach().numpy() 
 
-            print(f"Diagnostics -> Helix Error: {metrics['intra_helix_drmsd']:.2f}A | "
-                f"Sheet Error: {metrics['intra_sheet_drmsd']:.2f}A | ")
-            
-            if disto_logits is not None:
-                # 1. Distogram Prep (Expected Value)
-                probs = F.softmax(disto_logits[viz_index, :valid_len, :valid_len].detach(), dim=-1)
-                bin_indices = torch.arange(64, device=probs.device).float()
-                expected_bins = (probs * bin_indices).sum(dim=-1).cpu().numpy()
-                
-                viz_target_pdists = target_pdists[viz_index, :valid_len, :valid_len].detach()
-                true_bins = torch.floor((viz_target_pdists - 2.0) / (22.0 - 2.0) * 64).long()
-                true_bins = torch.clamp(true_bins, min=0, max=63).cpu().numpy()
-                
-                # ==========================================
-                # 2. [NEW] Secondary Structure Prep
-                # ==========================================
-                # Get True SS (shape: [L])
-                viz_true_ss = target_ss[viz_index, :valid_len].cpu().numpy()
-                
-                # Get Predicted SS (shape: [L]) by taking the argmax over the 3 classes
-                viz_pred_ss = ss_logits[viz_index, :valid_len].detach().argmax(dim=-1).cpu().numpy()
-                
-                # 3. Save the Plot
-                disto_save_path = f"outputs/full_eval/disto_step_{step:06d}.png"
-                
-                plot_distograms(
-                    pred_disto=expected_bins, 
-                    true_disto=true_bins, 
-                    pred_ss=viz_pred_ss, 
-                    true_ss=viz_true_ss, 
-                    save_path=disto_save_path
+                metrics = compute_contiguous_drmsd(
+                    pred_ca=pred_valid, 
+                    target_ca=true_valid, 
+                    target_ss=target_ss[viz_index, :valid_len].cpu().numpy(),
+                    valid_mask=mask_1d[viz_index, :valid_len].cpu().numpy()
                 )
 
-            plot_protein_comparison(
-                true_coords=true_valid, 
-                pred_coords=pred_valid, 
-                title=f"Train step {step} (Loss: {average_loss / 100:.4f})",
-                filename=f"outputs/full_eval/train_step_{step:06d}.html"
-            )
-            
-            average_loss = 0.0
-            average_mse_loss = 0.0
-            average_dist_loss = 0.0
-            average_3d_loss = 0.0
-            average_ss_loss = 0.0
-            average_disto_loss = 0.0
+                print(f"Diagnostics -> Helix Error: {metrics['intra_helix_drmsd']:.2f}A | "
+                      f"Sheet Error: {metrics['intra_sheet_drmsd']:.2f}A | ")
+                
+                if disto_logits is not None:
+                    probs = F.softmax(disto_logits[viz_index, :valid_len, :valid_len].detach(), dim=-1)
+                    bin_indices = torch.arange(64, device=probs.device).float()
+                    expected_bins = (probs * bin_indices).sum(dim=-1).cpu().numpy()
+                    
+                    viz_target_pdists = target_pdists[viz_index, :valid_len, :valid_len].detach()
+                    true_bins = torch.floor((viz_target_pdists - 2.0) / (22.0 - 2.0) * 64).long()
+                    true_bins = torch.clamp(true_bins, min=0, max=63).cpu().numpy()
+                    
+                    viz_true_ss = target_ss[viz_index, :valid_len].cpu().numpy()
+                    viz_pred_ss = ss_logits[viz_index, :valid_len].detach().argmax(dim=-1).cpu().numpy()
+                    
+                    disto_save_path = f"outputs/full_eval/disto_step_{global_step:06d}.png"
+                    
+                    plot_distograms(
+                        pred_disto=expected_bins, 
+                        true_disto=true_bins, 
+                        pred_ss=viz_pred_ss, 
+                        true_ss=viz_true_ss, 
+                        save_path=disto_save_path
+                    )
 
-        if (step + 1) % checkpoint_interval == 0:
-            ckpt_path = train_cfg.get("checkpoint_path", f"checkpoints/phase1_step_{step + 1}.pt")
-            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-            
-            # 1. Pack the complete training state
-            checkpoint_state = {
-                "step": step + 1,
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict() if scheduler else None,
-                "config": cfg
-            }
+                plot_protein_comparison(
+                    true_coords=true_valid, 
+                    pred_coords=pred_valid, 
+                    title=f"Global Step {global_step} (Tokens: {total_tokens_seen / 1e6:.2f}M)",
+                    filename=f"outputs/full_eval/train_step_{global_step:06d}.html"
+                )
 
-            # 2. Atomic Save (Write to a .tmp file first)
-            temp_path = ckpt_path + ".tmp"
-            torch.save(checkpoint_state, temp_path)
-            
-            # 3. Atomically overwrite the main file
-            os.replace(temp_path, ckpt_path)
-            
-            print(f"[INFO] Saved robust training checkpoint: {ckpt_path}")
+            # --- CHECKPOINTING ---
+            if global_step % checkpoint_interval == 0:
+                ckpt_path = train_cfg.get("checkpoint_path", f"checkpoints/phase1_step_{global_step}.pt")
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                
+                checkpoint_state = {
+                    "global_step": global_step,
+                    "total_tokens_seen": total_tokens_seen,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict() if scheduler else None,
+                    "config": cfg
+                }
+
+                temp_path = ckpt_path + ".tmp"
+                torch.save(checkpoint_state, temp_path)
+                os.replace(temp_path, ckpt_path)
+                
+                print(f"[INFO] Saved robust checkpoint at Global Step {global_step} | Tokens: {total_tokens_seen / 1e6:.2f}M")
+                
+        batch_idx += 1
 
 if __name__ == "__main__":
     main()

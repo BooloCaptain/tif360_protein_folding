@@ -3,7 +3,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.data import Sampler
 import csv
 
 from src.utils.config import get_config_from_cli_or_env
@@ -11,36 +10,7 @@ from src.data.dataset_full import ProteinDataset, collate_fn
 from src.models.factory import build_model_from_cfg
 from src.postproc.exporters import write_pdb
 from src.postproc.visualize import kabsch_align, plot_protein_comparison
-from src.train import compute_contiguous_drmsd
-
-
-class EvalMaxTokensBatchSampler(Sampler):
-    """Dynamic batching for evaluation: groups similar lengths, no infinite loops, no shuffling."""
-    def __init__(self, lengths, max_tokens=4096):
-        self.lengths = np.array(lengths)
-        self.max_tokens = max_tokens
-        self.indices = np.argsort(self.lengths)
-
-    def __iter__(self):
-        current_batch = []
-        max_len = 0
-        
-        for idx in self.indices:
-            l = self.lengths[idx]
-            if max(max_len, l) * (len(current_batch) + 1) > self.max_tokens:
-                if current_batch:
-                    yield current_batch
-                current_batch = [int(idx)]
-                max_len = l
-            else:
-                current_batch.append(int(idx))
-                max_len = max(max_len, l)
-                
-        if current_batch:
-            yield current_batch
-
-    def __len__(self):
-        return sum(self.lengths) // self.max_tokens + 1
+from src.train import compute_contiguous_drmsd, angles_to_3d_coords_memory_safe
 
 
 def calculate_gdt_ts(pred, target):
@@ -91,7 +61,6 @@ def calculate_top_l_half_long_contact_precision(pred_coords, target_coords, thre
     # Determine how many is L/2
     top_n = max(1, L // 2)
     
-    # We want the TOP predicted contacts (the ones the model thinks are closest)
     # np.argsort returns indices that sort the array from smallest distance to largest
     sort_indices = np.argsort(long_pred_dists)
     top_n_indices = sort_indices[:top_n]
@@ -144,6 +113,31 @@ def calculate_top_l_half_long_contact_precision_2d(contact_probs, target_coords,
     return precision
 
 
+def calculate_steric_clashes(pred_coords, seq_sep=3, clash_threshold=3.2):
+    """
+    Counts the number of physically impossible overlapping C-alpha atoms.
+    seq_sep=3 ensures we don't penalize adjacent residues bonded to each other.
+    clash_threshold=3.2A is a standard strict cutoff for C-alpha traces.
+    """
+    L = len(pred_coords)
+    if L < seq_sep:
+        return 0
+        
+    # Calculate all pairwise distances
+    diff = pred_coords[:, None, :] - pred_coords[None, :, :]
+    dists = np.linalg.norm(diff, axis=-1)
+    
+    # Get upper triangle indices for non-adjacent residues
+    i, j = np.triu_indices(L, k=seq_sep)
+    non_adj_dists = dists[i, j]
+    
+    # Count how many pairs are closer than physically possible
+    clashes = np.sum(non_adj_dists < clash_threshold)
+    
+    # Return clashes per 100 residues (standardizes the metric across lengths)
+    return (clashes / L) * 100
+
+
 def resolve_device(cfg_device):
     requested = str(cfg_device).lower()
     if requested.startswith("cuda") and torch.cuda.is_available():
@@ -156,26 +150,23 @@ def main():
     device = resolve_device(cfg.get("device", "cuda"))
     
     data_cfg = cfg.get("data", {})
+    subset_size_test = data_cfg.get("subset_size_test", None)
     print("[INFO] Loading real protein test dataset...")
     ds = ProteinDataset(
-        split="test",
+        split="valid-10",
         casp_version=12,
         thinning=30,
-        max_len=data_cfg.get("max_len", 4096),
+        max_len=data_cfg.get("max_len_test", 4096),
+        subset_size=subset_size_test
     )
-
-    lengths = [ds.get_length(i) for i in range(len(ds))]
-    eval_max_tokens = cfg.get("inference", {}).get("max_tokens", 8000)
-    eval_sampler = EvalMaxTokensBatchSampler(lengths, max_tokens=eval_max_tokens)
     
     loader = DataLoader(
         ds, 
-        batch_sampler=eval_sampler, 
         collate_fn=collate_fn,
-        num_workers=16,              
-        pin_memory=True,             
-        prefetch_factor=3,
-        persistent_workers=True          
+        batch_size=1, 
+        shuffle=False,      # Guarantees perfect determinism across epochs
+        pin_memory=True,
+        num_workers=4
     )
 
     model_cfg = cfg.get("model", {})
@@ -201,24 +192,27 @@ def main():
     all_s_drmsds = []
     all_top_l_long = []
     all_top_l_long_2d = []
+    all_steric_clashes = []
 
     out_cfg = cfg.get("export", {})
     out_dir = out_cfg.get("output_dir", "outputs/evaluation_results")
     os.makedirs(out_dir, exist_ok=True)
 
-    from src.train import angles_to_3d_coords_memory_safe
-
-    print(f"\n{'Sample':<7} | {'Len':<4} | {'RMSD':<6} | {'dRMSD':<6} | {'H-dRM':<6} | {'S-dRM':<6} | {'TM-Scr':<6} | {'GDT-TS':<6} | {'Q3':<5} | {'T-L/2_Prec':<12} | {'T-L/2_Prec_2D':<12}")
-    print("-" * 90)
+    # Updated Print Header to include the Size Bucket
+    print(f"\n{'Sample':<7} | {'Len':<4} | {'Bucket':<6} | {'RMSD':<6} | {'dRMSD':<6} | {'TM-Scr':<6} | {'GDT-TS':<6} | {'Q3':<5} | {'T-L/2 (3D)':<10} | {'T-L/2 (2D)':<10} | {'Steric Clashes':<15}")
+    print("-" * 105)
 
     total_samples_processed = 0
 
     with torch.no_grad():
         for batch_idx, batch in enumerate(loader):
             tokens = batch["tokens"].to(device, non_blocking=True)
-            padding_mask = batch["pad_mask"].to(device, non_blocking=True)
             
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            # [FIXED]: Generates an empty boolean mask dynamically to prevent KeyErrors
+            padding_mask = torch.zeros_like(tokens, dtype=torch.bool).to(device, non_blocking=True)
+            
+            # [FIXED]: Uses device.type dynamically to prevent CPU crashes
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 pred_1d, ss_logits, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
                 pred_coords = angles_to_3d_coords_memory_safe(pred_1d, tokens, device)
             
@@ -245,7 +239,9 @@ def main():
                 dssp_str = dssp_strs[b][:L]
 
                 valid_mask = (mask_1d > 0) & ~np.isnan(target_coords_np).any(axis=1)
-                if valid_mask.sum() < 15:
+                
+                valid_len = valid_mask.sum()
+                if valid_len < 15:
                     total_samples_processed += 1
                     continue 
                     
@@ -263,42 +259,54 @@ def main():
                 top_l_prec = calculate_top_l_half_long_contact_precision(eval_pred_coords, eval_true_coords)
                 viz_disto_logits = disto_logits[b, :L, :L]
                 
-                # 2. Convert to probabilities (Using your .float() fix!)
                 viz_probs = F.softmax(viz_disto_logits.float(), dim=-1).detach().cpu().numpy()
-                
-                # 3. Sum the probabilities of Bins 0-19 (representing 2.0A to 8.0A)
-                # This squashes the 64 bins down into a single [L, L] matrix of contact confidence
                 contact_probs = np.sum(viz_probs[:, :, 0:20], axis=-1)
                 
-                # 4. Calculate metric directly from the 2D probabilities (Filtered by valid_mask!)
                 top_l_prec_2d = calculate_top_l_half_long_contact_precision_2d(
                     contact_probs=contact_probs[valid_mask][:, valid_mask], 
                     target_coords=eval_true_coords
                 )
+                
                 metrics = compute_contiguous_drmsd(
-                    pred_ca=coords_np,           # NumPy array
-                    target_ca=target_coords_np,  # NumPy array
-                    target_ss=target_ss,         # NumPy array (0=H, 1=E, 2=C)
-                    valid_mask=valid_mask        # NumPy boolean mask
+                    pred_ca=coords_np,
+                    target_ca=target_coords_np,
+                    target_ss=target_ss,
+                    valid_mask=valid_mask
                 )
+
+                steric_clashes = calculate_steric_clashes(coords_np[valid_mask])
+                
                 full_d = metrics['full_drmsd']
                 h_d = metrics['intra_helix_drmsd']
                 s_d = metrics['intra_sheet_drmsd']
+
+                # Categorize the Size Bucket
+                if valid_len < 200:
+                    bucket = "Short"
+                elif valid_len < 500:
+                    bucket = "Medium"
+                else:
+                    bucket = "Long"
 
                 all_rmsds.append(rmsd_val)
                 all_gdt_ts.append(gdt_val)
                 all_tm_scores.append(tm_val)
                 all_q3_accs.append(q3_val)
-                all_lengths.append(valid_mask.sum())
+                all_lengths.append(valid_len)
                 all_full_drmsds.append(full_d)
                 all_h_drmsds.append(h_d)
                 all_s_drmsds.append(s_d)
                 all_top_l_long.append(top_l_prec)
                 all_top_l_long_2d.append(top_l_prec_2d)
-                if total_samples_processed % 50 == 0:
-                    print(f"{total_samples_processed:05d}   | {valid_mask.sum():<4} | {rmsd_val:<6.2f} | {full_d:<6.2f} | {h_d:<6.2f} | {s_d:<6.2f} | {tm_val:<6.3f} | {gdt_val:<6.4f} | {q3_val * 100:.1f}% | {top_l_prec * 100:.1f}% | {top_l_prec_2d * 100:.1f}%")
+                all_steric_clashes.append(steric_clashes)
 
-                if total_samples_processed % 1000 == 0: 
+                # Dynamic print frequency based on subset size
+                print_freq = max(1, int(subset_size_test / 100) if subset_size_test else 1)
+                if total_samples_processed % print_freq == 0:
+                    print(f"{total_samples_processed:05d}   | {valid_len:<4} | {bucket:<6} | {rmsd_val:<6.2f} | {full_d:<6.2f} | {tm_val:<6.3f} | {gdt_val:<6.4f} | {q3_val * 100:>4.1f}% | {top_l_prec * 100:>8.1f}% | {top_l_prec_2d * 100:>8.1f}% | {steric_clashes:<15.2f}")
+
+                export_freq = max(1, int(subset_size_test / 10) if subset_size_test else 10)
+                if total_samples_processed % export_freq == 0: 
                     pred_path = os.path.join(out_dir, f"test_{total_samples_processed:05d}_pred.pdb")
                     true_path = os.path.join(out_dir, f"test_{total_samples_processed:05d}_true.pdb")
                     write_pdb(pred_path, aligned_pred_coords)
@@ -314,54 +322,79 @@ def main():
                 
                 total_samples_processed += 1
 
-    # ... (After total_samples_processed += 1 and breaking out of the loop)
 
     # ==========================================
-    # [NEW] Filtered Top-L/2 Aggregation (3D and 2D)
+    # [NEW] Stratified Aggregation & Summaries
     # ==========================================
     lengths_np = np.array(all_lengths)
-    top_l_np_3d = np.array(all_top_l_long)     # The 3D NeRF metric
-    top_l_np_2d = np.array(all_top_l_long_2d)  # The 2D Distogram metric
+    tm_np = np.array(all_tm_scores)
+    gdt_np = np.array(all_gdt_ts)
+    top_l_np_3d = np.array(all_top_l_long)
+    top_l_np_2d = np.array(all_top_l_long_2d)
 
-    # Standard CASP Threshold: Only evaluate long-range contacts on proteins L >= 50
-    tertiary_threshold_mask = lengths_np >= 50
-    
-    if tertiary_threshold_mask.sum() > 0:
-        # Calculate mean ONLY for proteins long enough to have real tertiary structure
-        true_mean_top_l_3d = np.nanmean(top_l_np_3d[tertiary_threshold_mask])
-        true_mean_top_l_2d = np.nanmean(top_l_np_2d[tertiary_threshold_mask])
-    else:
-        true_mean_top_l_3d = np.nan
-        true_mean_top_l_2d = np.nan
+    # Boolean masks for buckets
+    mask_short = lengths_np < 200
+    mask_medium = (lengths_np >= 200) & (lengths_np < 500)
+    mask_long = lengths_np >= 500
+    mask_tertiary = lengths_np >= 50
 
-    print("\n" + "="*45 + "\nFINAL EVALUATION SUMMARY STATISTICS\n" + "="*45)
+    # Safe mean calculation helper
+    def safe_mean(metric_arr, mask):
+        filtered = metric_arr[mask]
+        return np.nanmean(filtered) if len(filtered) > 0 else 0.0
+
+    print("\n" + "="*55)
+    print("FINAL EVALUATION SUMMARY STATISTICS")
+    print("="*55)
     print(f"Total Evaluated Proteins:       {len(all_rmsds)}")
-    print(f"Proteins L >= 50 (Tertiary):    {tertiary_threshold_mask.sum()}")
-    print("-" * 45)
-    print(f"Mean Global RMSD:               {np.mean(all_rmsds):.3f} Å")
-    print(f"Mean Full sequence dRMSD:       {np.nanmean(all_full_drmsds):.3f} Å")
-    print(f"Mean Intra-Helix dRMSD:         {np.nanmean(all_h_drmsds):.3f} Å")
-    print(f"Mean Intra-Sheet dRMSD:         {np.nanmean(all_s_drmsds):.3f} Å")
-    print(f"Mean Dataset GDT-TS:            {np.mean(all_gdt_ts):.4f}")
-    print(f"Mean Dataset TM-Score:          {np.mean(all_tm_scores):.4f}")
-    print(f"Mean Dataset Q3 SS Accuracy:    {np.mean(all_q3_accs)*100:.2f}%")
-    print("-" * 45)
-    # Print the FILTERED means here!
-    print(f"Top-L/2 Long Prec (3D NeRF):    {true_mean_top_l_3d*100:.2f}% (Proteins L>=50)")
-    print(f"Top-L/2 Long Prec (2D Disto):   {true_mean_top_l_2d*100:.2f}% (Proteins L>=50)")
-    print("=" * 45)
+    print("-" * 55)
+    
+    # Global Metrics
+    print(f"Global Mean RMSD:               {np.mean(all_rmsds):.3f} Å")
+    print(f"Global Mean full dRMSD:         {np.nanmean(all_full_drmsds):.3f} Å")
+    print(f"Global Mean Q3 SS Accuracy:     {np.mean(all_q3_accs)*100:.2f}%")
+    print(f"Global Mean Steric Clashes/100 Residues:     {np.mean(all_steric_clashes):.2f}")
+    print("-" * 55)
+    
+    # [NEW] STRATIFIED TM-SCORE RESULTS
+    print("TM-SCORE STRATIFICATION:")
+    print(f"  Short (<200)   [N={mask_short.sum():<3}]:   {safe_mean(tm_np, mask_short):.4f}")
+    print(f"  Medium (200+)  [N={mask_medium.sum():<3}]:   {safe_mean(tm_np, mask_medium):.4f}")
+    print(f"  Long (500+)    [N={mask_long.sum():<3}]:   {safe_mean(tm_np, mask_long):.4f}")
+    print(f"  GLOBAL TM-SCORE:            {np.mean(tm_np):.4f}")
+    print("-" * 55)
+
+    # GDT-TS
+    print("GDT-TS STRATIFICATION:")
+    print(f"  Short (<200):               {safe_mean(gdt_np, mask_short):.4f}")
+    print(f"  Medium (200+):              {safe_mean(gdt_np, mask_medium):.4f}")
+    print(f"  Long (500+):                {safe_mean(gdt_np, mask_long):.4f}")
+    print("-" * 55)
+
+    # Tertiary Contacts (Filtered)
+    print(f"Proteins L >= 50 (Tertiary):    {mask_tertiary.sum()}")
+    print(f"Top-L/2 Long Prec (3D NeRF):    {safe_mean(top_l_np_3d, mask_tertiary)*100:.2f}%")
+    print(f"Top-L/2 Long Prec (2D Disto):   {safe_mean(top_l_np_2d, mask_tertiary)*100:.2f}%")
+    print("=" * 55)
 
     csv_path = os.path.join(out_dir, "evaluation_metrics_summary.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "Sample_ID", "Valid_Length", "RMSD_Angstroms", 
+            "Sample_ID", "Valid_Length", "Bucket", "RMSD_Angstroms", 
             "Full_dRMSD", "Helix_dRMSD", "Sheet_dRMSD", 
-            "GDT_TS", "TM_Score", "Q3_Accuracy", "Top-L/2_Prec_3D", "Top-L/2_Prec_2D"
+            "GDT_TS", "TM_Score", "Q3_Accuracy", "Top-L/2_Prec_3D", "Top-L/2_Prec_2D", "Steric_Clashes_Per_100_Residues"
         ])
         for i in range(len(all_rmsds)):
+            
+            # Determine bucket for CSV
+            L = all_lengths[i]
+            if L < 200: b = "Short"
+            elif L < 500: b = "Medium"
+            else: b = "Long"
+
             writer.writerow([
-                i, all_lengths[i], 
+                i, L, b,
                 f"{all_rmsds[i]:.4f}", 
                 f"{all_full_drmsds[i]:.4f}", 
                 f"{all_h_drmsds[i]:.4f}", 
@@ -369,9 +402,9 @@ def main():
                 f"{all_gdt_ts[i]:.4f}", 
                 f"{all_tm_scores[i]:.4f}", 
                 f"{all_q3_accs[i]:.4f}", 
-                # Write the RAW individual values to the CSV so you have the full data
                 f"{all_top_l_long[i]:.4f}",
-                f"{all_top_l_long_2d[i]:.4f}"
+                f"{all_top_l_long_2d[i]:.4f}",
+                f"{all_steric_clashes[i]:.2f}"
             ])
     print(f"[INFO] Saved full metrics dataset to {csv_path}")
 

@@ -3,8 +3,10 @@ seed: 42
 device: cuda
 
 data:
-  split: casp12
+  split: train
   max_len: 200
+  max_len_test: 4096
+  subset_size_test: 1000
   use_sidechainnet_if_available: true
   dynamic_batching: true
 
@@ -15,7 +17,7 @@ model:
   num_layers: 6
   dim_feedforward: 1024
   dropout: 0.1
-  max_len: 200
+  max_len: 4096
   head_hidden: 128
   d_pair: 128
   
@@ -38,28 +40,29 @@ model:
   #   - 'unfreeze_last_n' (or 'partial'): Uses pre-trained ESM-2, unfreezing only the top N layers.
   #   - 'finetune' (or 'trainable'): Uses pre-trained ESM-2, unfreezing all 650M parameters.
   #   - 'learned' (or 'fresh_embedding'): Drops ESM-2 entirely; trains a simple nn.Embedding from scratch.
-  esm_mode: learned
-  esm_unfreeze_last_n: 2
+  esm_mode: unfreeze_last_n
+  esm_unfreeze_last_n: 0
   
   # Inject the global 2D spatial awareness pool back into the final 1D sequence track before the head?
   pair_context_to_head: true
 
 training:
   resume_from_checkpoint: false
-  max_tokens: 1000
+  max_tokens: 3333
   megabatch_size: 10000
   lr: 1e-4 
   min_lr_ratio: 0.001
-  total_steps: 100000
-  warmup_steps: 10000
-  decay_steps: 100000
-  warmup_steps_3d: 10000
-  warmup_steps_band_mask: 10000
+  total_steps: 5000
+  warmup_steps: 500
+  decay_steps: 5000
+  warmup_steps_3d: 500
+  warmup_steps_band_mask: 2500
   max_band_mask_size: 200
-  checkpoint_interval: 1000
+  checkpoint_interval: 100
+  logging_interval: 100
   checkpoint_path: checkpoints/phase1_full_mini.pt
   compile: false
-  accumulation_steps: 20
+  accumulation_steps: 4
 
 loss:
   lambda_distance: 1.0   
@@ -69,7 +72,7 @@ loss:
   use_3d_loss: false
 
 inference:
-  max_tokens: 750
+  max_tokens: 5000
   checkpoint_path: checkpoints/phase1_full_mini.pt
 
 postproc:

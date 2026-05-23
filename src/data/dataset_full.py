@@ -8,6 +8,7 @@ except Exception:
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from sklearn.model_selection import train_test_split
 
 # Replace amino-acid mapping with ESM-2's integer mapping.
 # Note: ESM reserves index 1 for <pad> so our sequences remain aligned with CA coordinates.
@@ -40,20 +41,24 @@ class ProteinDataset(Dataset):
       - 'coords': FloatTensor (L,3) C-alpha coordinates
       - 'ss': LongTensor (L,) secondary structure labels
     """
-    def __init__(self, split='test', casp_version=12, thinning=30, max_len=1024, raw_data=None):
+    def __init__(self, split='test', casp_version=12, thinning=30, max_len=256, raw_data=None, filter_max_len=False, subset_size=None):
         """Load real protein dataset from SidechainNet.
         
         Args:
             split: Which data split to extract ('train', 'valid-10', 'test', etc.)
             casp_version: CASP dataset version (default 12)
             thinning: Thinning factor (default 30 to match your downloaded file)
-            max_len: Maximum sequence length
+            max_len: Maximum sequence length (used for cropping or filtering)
             raw_data: Optional raw SidechainNet data dictionary.
+            filter_max_len: If True, strictly removes any protein longer than max_len.
+            subset_size: If set, shrinks the dataset to this exact size while preserving length distributions.
         """
         self.split = split
         self.max_len = max_len
         self.casp_version = casp_version
         self.thinning = thinning
+        self.filter_max_len = filter_max_len
+        self.subset_size = subset_size  # <-- [NEW] Store subset size
         
         if raw_data is not None:
             self.data = self._parse_raw_data(raw_data, self.split)
@@ -75,6 +80,46 @@ class ProteinDataset(Dataset):
                     f"Failed to load SidechainNet dataset: {e}\n"
                     "Ensure SidechainNet is properly installed."
                 ) from e
+
+        # ==========================================
+        # 1. Strict Validation/Training Filter
+        # ==========================================
+        if self.filter_max_len and self.data:
+            original_count = len(self.data)
+            self.data = [
+                rec for rec in self.data 
+                if len(_rec_get(rec, ('primary', 'sequence', 'seq'), default='')) <= self.max_len
+            ]
+            print(f"[INFO] {self.split.upper()} Filter: Kept {len(self.data)}/{original_count} proteins (Length <= {self.max_len})")
+
+        # ==========================================
+        # 2. [NEW] Scikit-Learn Stratified Truncation
+        # ==========================================
+        if self.subset_size is not None and self.data and self.subset_size < len(self.data):
+            # Create an array of labels representing our length buckets
+            bucket_labels = []
+            for rec in self.data:
+                L = len(_rec_get(rec, ('primary', 'sequence', 'seq'), default=''))
+                if L < 200: bucket_labels.append("short")
+                elif L < 500: bucket_labels.append("medium")
+                else: bucket_labels.append("long")
+                
+            # Let Scikit-Learn do the complex stratification math
+            try:
+                _, self.data = train_test_split(
+                    self.data, 
+                    test_size=self.subset_size, 
+                    stratify=bucket_labels, 
+                    random_state=42  # Locks it deterministically for smooth loss curves
+                )
+                print(f"[INFO] {self.split.upper()} Stratified to {len(self.data)} proteins using Scikit-Learn.")
+            except ValueError as e:
+                # Fallback just in case a bucket is so small Scikit-Learn refuses to stratify it
+                import random
+                rng = random.Random(42)
+                self.data = rng.sample(self.data, self.subset_size)
+                print(f"[WARNING] Stratified sampling failed: {e}. Randomly truncated to {len(self.data)} proteins.")
+
 
     def _parse_raw_data(self, raw_data, target_split):
         """Pivots SidechainNet's dict-of-lists into a list-of-dicts for __getitem__"""
@@ -137,35 +182,63 @@ class ProteinDataset(Dataset):
             raise RuntimeError("Dataset not initialized")
 
         rec = self.data[idx]
+        
+        # ==========================================
+        # 1. Extract FULL sequences and coordinates
+        # ==========================================
         seq = _rec_get(rec, ('primary', 'sequence', 'seq'), default='')
         tokens = self._seq_to_tokens(seq)
-
         coords = _extract_ca_coords(rec)
-        L = min(len(tokens), coords.shape[0], self.max_len)
-        tokens = tokens[:L]
-        coords = coords[:L]
+        
+        # Extract FULL DSSP
+        dssp_raw = _rec_get(rec, ('sec', 'secondary_structure', 'dssp'), default=' ' * len(tokens))
+        if hasattr(dssp_raw, '__len__') and not isinstance(dssp_raw, str):
+            dssp_str = "".join([str(c) for c in dssp_raw])
+        else:
+            dssp_str = str(dssp_raw)
+            
+        # Extract FULL Missing Mask
+        raw_mask = _extract_missing_mask(rec, len(tokens))
+
+        # Determine the valid full length (shortest of all extracted arrays to prevent index out of bounds)
+        L_full = min(len(tokens), coords.shape[0], len(dssp_str), len(raw_mask))
+        
+        # ==========================================
+        # 2. SPATIAL CROPPING LOGIC
+        # ==========================================
+        if 'train' in self.split.lower() and L_full > self.max_len:
+            # Training: Randomly crop to max_len
+            start_idx = np.random.randint(0, L_full - self.max_len + 1)
+            end_idx = start_idx + self.max_len
+        else:
+            # Testing/Validation (or if L_full <= max_len): pass the FULL protein!
+            start_idx = 0
+            end_idx = L_full
+            
+        # Apply the crop perfectly across all dimensions
+        tokens = tokens[start_idx : end_idx]
+        coords = coords[start_idx : end_idx]
+        dssp_str = dssp_str[start_idx : end_idx]
+        raw_mask_cropped = raw_mask[start_idx : end_idx].copy()
+        
+        L_crop = len(tokens)
+        
+        # ==========================================
+        # 3. Calculate internal targets ON THE CROP
+        # ==========================================
+        # We calculate the angles/distances after cropping, effectively treating 
+        # the cropped segment as its own independent contiguous chain.
         angles, distances = ca_to_internal_targets(coords)
         
-        # --- NEW: Extract DSSP String ---
-        # SidechainNet uses 'sec' or 'secondary_structure'. Default to spaces if missing.
-        dssp_raw = _rec_get(rec, ('sec', 'secondary_structure', 'dssp'), default=' ' * L)
-        
-        if hasattr(dssp_raw, '__len__') and not isinstance(dssp_raw, str):
-            dssp_str = "".join([str(c) for c in dssp_raw])[:L]
-        else:
-            dssp_str = str(dssp_raw)[:L]
-        # --------------------------------
-        
-        raw_mask = _extract_missing_mask(rec, L)
-        
-        mask_1d = raw_mask.copy()
-        for i in range(L):
-            if raw_mask[i] == 0:
-                if i + 1 < L: mask_1d[i + 1] = 0
-                if i + 2 < L: mask_1d[i + 2] = 0
-                if i + 3 < L: mask_1d[i + 3] = 0
+        # Build the NeRF cascading masks based on the cropped mask
+        mask_1d = raw_mask_cropped.copy()
+        for i in range(L_crop):
+            if raw_mask_cropped[i] == 0:
+                if i + 1 < L_crop: mask_1d[i + 1] = 0
+                if i + 2 < L_crop: mask_1d[i + 2] = 0
+                if i + 3 < L_crop: mask_1d[i + 3] = 0
 
-        mask_3d = raw_mask.copy()
+        mask_3d = raw_mask_cropped.copy()
 
         return {
             'tokens': tokens,
@@ -175,7 +248,7 @@ class ProteinDataset(Dataset):
             'angles': angles,
             'distances': distances,
             'coords': coords,
-            'dssp_str': dssp_str  # <-- NEW
+            'dssp_str': dssp_str
         }
 
 
@@ -337,7 +410,9 @@ def ca_to_internal_targets(ca_coords):
 def collate_fn(batch: List[dict]):
     batch_size = len(batch)
     lengths = [item['tokens'].shape[0] for item in batch]
-    max_len = max(lengths)
+    actual_max_len = max(lengths)
+    pad_multiple = 64
+    max_len = ((actual_max_len + pad_multiple - 1) // pad_multiple) * pad_multiple
     
     # Fill empty space with 1 (ESM-2 padding token)
     tokens = torch.ones((batch_size, max_len), dtype=torch.long) * 1 
@@ -384,7 +459,7 @@ def collate_fn(batch: List[dict]):
         'lengths': lengths, 
         'pad_mask': pad_mask,
         'dssp_strs': dssp_strs,
-        'target_ss': target_ss # <-- NEW: Pass the integer tensor to the training loop
+        'target_ss': target_ss
     }
 
 

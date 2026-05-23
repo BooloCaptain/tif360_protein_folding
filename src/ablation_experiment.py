@@ -306,7 +306,7 @@ def main():
     
     # We load the dataset without the batch sampler so we can iterate sequentially easily
     print("[INFO] Loading dataset for Ablation Study...")
-    ds = ProteinDataset(split="test", casp_version=12, thinning=30, max_len=2000)
+    ds = ProteinDataset(split="valid-10", casp_version=12, thinning=30, max_len=2000)
     loader = DataLoader(ds, batch_size=1, collate_fn=collate_fn, num_workers=4)
 
     model_cfg = cfg.get("model", {})
