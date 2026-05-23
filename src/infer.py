@@ -8,7 +8,7 @@ import csv
 
 from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
-from src.models.transformer import ProteinFoldingNetwork  
+from src.models.factory import build_model_from_cfg
 from src.postproc.exporters import write_pdb
 from src.postproc.visualize import kabsch_align, plot_protein_comparison
 from src.train import compute_contiguous_drmsd
@@ -151,77 +151,6 @@ def resolve_device(cfg_device):
     return torch.device("cpu")
 
 
-def distogram_expected_angstroms(disto_logits, disto_span=20.0, disto_offset=2.0):
-    """
-    Converts distogram logits [L, L, num_bins] into expected distances [L, L] in Angstroms.
-    """
-    probs = F.softmax(disto_logits.float().detach(), dim=-1)
-    num_bins = probs.shape[-1]
-    bin_indices = torch.arange(num_bins, device=probs.device, dtype=probs.dtype)
-    expected_bins = (probs * bin_indices).sum(dim=-1)
-    return (expected_bins * (float(disto_span) / float(num_bins))) + float(disto_offset)
-
-
-def masked_torsion_refinement(
-    pred_angles,
-    expected_dists,
-    pred_ss,
-    tokens,
-    device,
-    steps=100,      # [SPEED HACK]: Dropped from 300 to 100
-    lr=0.2,         # [SPEED HACK]: Doubled the learning rate for faster convergence
-    contact_cutoff=15.0,
-    stop_threshold=0.5 # [NEW]: Early stopping threshold
-):
-    """
-    Refines NeRF torsions against distogram expected distances while freezing
-    predicted helices/sheets by masking their gradients before optimizer step.
-    Includes Early Stopping for massive speedups.
-    """
-    from src.train import angles_to_3d_coords_memory_safe
-
-    optimizable_angles = pred_angles.clone().detach().float().requires_grad_(True)
-    optimizer = torch.optim.Adam([optimizable_angles], lr=float(lr))
-
-    is_coil = (pred_ss == 2)
-    valid_pairs = (expected_dists < float(contact_cutoff)).clone()
-    torch.diagonal(valid_pairs).fill_(False)
-
-    if valid_pairs.sum() == 0:
-        return pred_angles.detach()
-
-    target_d = expected_dists[valid_pairs].detach().float()
-
-    for step in range(int(steps)):
-        optimizer.zero_grad()
-        coords = angles_to_3d_coords_memory_safe(optimizable_angles, tokens, device)[0]
-        
-        diff = coords.unsqueeze(1) - coords.unsqueeze(0)
-        current_d = torch.norm(diff + 1e-8, dim=-1)
-        
-        loss = F.mse_loss(current_d[valid_pairs], target_d)
-        
-        # ==========================================
-        # [SPEED HACK 1]: Early Stopping
-        # ==========================================
-        if loss.item() < stop_threshold:
-            # The structure has satisfied the Distogram! Terminate immediately.
-            break 
-            
-        loss.backward()
-
-        if optimizable_angles.grad is not None:
-            optimizable_angles.grad[:, ~is_coil, :] = 0.0
-
-        optimizer.step()
-        
-        # Keep the GPU sync to prevent RAM crashes
-        if (step + 1) % 50 == 0:
-            torch.cuda.synchronize()
-
-    return optimizable_angles.detach()
-
-
 def main():
     cfg = get_config_from_cli_or_env()
     device = resolve_device(cfg.get("device", "cuda"))
@@ -250,12 +179,7 @@ def main():
     )
 
     model_cfg = cfg.get("model", {})
-    model = ProteinFoldingNetwork(
-        d_model=int(model_cfg.get("d_model", 256)),
-        nhead=int(model_cfg.get("nhead", 8)),
-        num_layers=int(model_cfg.get("num_layers", 6)),
-        d_pair=int(model_cfg.get("d_pair", 128))
-    ).to(device)
+    model = build_model_from_cfg(model_cfg).to(device)
 
     ckpt_path = cfg.get("inference", {}).get("checkpoint_path", "checkpoints/phase1_full_mini.pt")
     if os.path.exists(ckpt_path):
@@ -266,21 +190,6 @@ def main():
         print(f"[WARNING] Checkpoint {ckpt_path} not found. Executing with random weights.")
 
     model.eval()
-
-    infer_cfg = cfg.get("inference", {})
-    torsion_refine_cfg = infer_cfg.get("torsion_refinement", {})
-    refine_enabled = bool(torsion_refine_cfg.get("enabled", True))
-    refine_steps = int(torsion_refine_cfg.get("steps", 50))
-    refine_lr = float(torsion_refine_cfg.get("lr", 0.1))
-    refine_contact_cutoff = float(torsion_refine_cfg.get("contact_cutoff", 15.0))
-    refine_disto_span = float(torsion_refine_cfg.get("disto_span", 20.0))
-    refine_disto_offset = float(torsion_refine_cfg.get("disto_offset", 2.0))
-
-    if refine_enabled:
-        print(
-            "[INFO] Torsion refinement enabled "
-            f"(steps={refine_steps}, lr={refine_lr}, cutoff={refine_contact_cutoff}A)"
-        )
     
     all_rmsds = []
     all_gdt_ts = []
@@ -312,16 +221,6 @@ def main():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 pred_1d, ss_logits, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
                 pred_coords = angles_to_3d_coords_memory_safe(pred_1d, tokens, device)
-
-            expected_dists = None
-            pred_ss_labels = None
-            if refine_enabled:
-                expected_dists = distogram_expected_angstroms(
-                    disto_logits,
-                    disto_span=refine_disto_span,
-                    disto_offset=refine_disto_offset,
-                )
-                pred_ss_labels = torch.argmax(ss_logits.detach(), dim=-1)
             
             pred_1d_cpu = pred_1d.float().cpu().numpy()
             pred_coords_cpu = pred_coords.float().cpu().numpy()
@@ -336,8 +235,7 @@ def main():
             
             for b in range(B):
                 L = batch["lengths"][b]
-
-                # 1. Extract raw outputs for this specific protein
+                
                 pred_np = pred_1d_cpu[b, :L, :]
                 coords_np = pred_coords_cpu[b, :L, :]
                 target_coords_np = target_coords_cpu[b, :L, :3]
@@ -346,34 +244,10 @@ def main():
                 mask_1d = mask_1d_cpu[b, :L]
                 dssp_str = dssp_strs[b][:L]
 
-                # 2. Calculate the valid mask IMMEDIATELY
                 valid_mask = (mask_1d > 0) & ~np.isnan(target_coords_np).any(axis=1)
-
                 if valid_mask.sum() < 15:
                     total_samples_processed += 1
-                    continue
-
-                # 3. [FIX 3]: Gate Refinement by length
-                # Only run the heavy optimization if the protein actually has tertiary structure!
-                if refine_enabled and valid_mask.sum() >= 50:
-                    with torch.enable_grad():
-                        refined_angles = masked_torsion_refinement(
-                            pred_angles=pred_1d[b:b+1, :L, :],
-                            expected_dists=expected_dists[b, :L, :L],
-                            pred_ss=pred_ss_labels[b, :L],
-                            tokens=tokens[b:b+1, :L],
-                            device=device,
-                            steps=refine_steps,
-                            lr=refine_lr,
-                            contact_cutoff=refine_contact_cutoff,
-                        )
-                        refined_coords = angles_to_3d_coords_memory_safe(
-                            refined_angles,
-                            tokens[b:b+1, :L],
-                            device,
-                        )[0]
-                    coords_np = refined_coords.detach().float().cpu().numpy()
-                    pred_coords_cpu[b, :L, :] = coords_np
+                    continue 
                     
                 eval_pred_coords = coords_np[valid_mask]
                 eval_true_coords = target_coords_np[valid_mask]

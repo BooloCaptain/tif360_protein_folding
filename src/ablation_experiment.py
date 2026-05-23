@@ -10,6 +10,7 @@ from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.models.transformer import ProteinFoldingNetwork  
 from src.postproc.visualize import kabsch_align, plot_protein_comparison
+from src.models.factory import build_model_from_cfg
 from src.train import angles_to_3d_coords_memory_safe
 
 
@@ -309,12 +310,7 @@ def main():
     loader = DataLoader(ds, batch_size=1, collate_fn=collate_fn, num_workers=4)
 
     model_cfg = cfg.get("model", {})
-    model = ProteinFoldingNetwork(
-        d_model=int(model_cfg.get("d_model", 256)),
-        nhead=int(model_cfg.get("nhead", 8)),
-        num_layers=int(model_cfg.get("num_layers", 6)),
-        d_pair=int(model_cfg.get("d_pair", 128))
-    ).to(device)
+    model = build_model_from_cfg(model_cfg).to(device)
 
     ckpt_path = cfg.get("inference", {}).get("checkpoint_path", "checkpoints/phase1_full_mini.pt")
     if os.path.exists(ckpt_path):

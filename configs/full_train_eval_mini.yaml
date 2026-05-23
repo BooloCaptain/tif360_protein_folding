@@ -9,7 +9,7 @@ data:
   dynamic_batching: true
 
 model:
-  vocab_size: 21
+  vocab_size: 33
   d_model: 256
   nhead: 8
   num_layers: 6
@@ -18,30 +18,55 @@ model:
   max_len: 200
   head_hidden: 128
   d_pair: 128
+  
+  # ==========================================
+  # Architectural Toggles (Driven by Factory)
+  # ==========================================
+  # block_type controls how the 1D Sequence and 2D Pair tracks interact:
+  #   - 'two_track' (or 'full'): 2D biases 1D attention, AND 1D updates the 2D track via outer product.
+  #   - 'pair_bias' (or 'pair_input'): 2D biases 1D attention, but 2D track is NOT updated (saves VRAM).
+  #   - '1d' (or 'standard'): 2D track is ignored. Standard Transformer.
+  block_type: 1d 
+  
+  # head_mode controls how geometry and secondary structure (SS) are predicted:
+  #   - 'direct': Predicts 5D geometry and 8-state SS in parallel from the 1D hidden state.
+  #   - 'hierarchical_ss': Predicts SS first, then feeds SS probabilities into the geometry predictor.
+  #   - 'hierarchical_ss_disto': Predicts SS first, then feeds SS *and* 2D Distogram context into geometry.
+  head_mode: hierarchical_ss_disto
+  
+  # esm_mode controls the input embedding strategy:
+  #   - 'unfreeze_last_n' (or 'partial'): Uses pre-trained ESM-2, unfreezing only the top N layers.
+  #   - 'finetune' (or 'trainable'): Uses pre-trained ESM-2, unfreezing all 650M parameters.
+  #   - 'learned' (or 'fresh_embedding'): Drops ESM-2 entirely; trains a simple nn.Embedding from scratch.
+  esm_mode: learned
+  esm_unfreeze_last_n: 2
+  
+  # Inject the global 2D spatial awareness pool back into the final 1D sequence track before the head?
+  pair_context_to_head: true
 
 training:
-  resume_from_checkpoint: true
-  max_tokens: 500
+  resume_from_checkpoint: false
+  max_tokens: 1000
   megabatch_size: 10000
-  lr: 1e-4 # peak learning rate
+  lr: 1e-4 
   min_lr_ratio: 0.001
-  total_steps: 250000
+  total_steps: 100000
   warmup_steps: 10000
-  decay_steps: 250000
+  decay_steps: 100000
   warmup_steps_3d: 10000
   warmup_steps_band_mask: 10000
   max_band_mask_size: 200
   checkpoint_interval: 1000
   checkpoint_path: checkpoints/phase1_full_mini.pt
   compile: false
-  accumulation_steps: 40
+  accumulation_steps: 20
 
 loss:
-  lambda_distance: 1.0   # Keep at 1.0
-  lambda_3d: 0.0         # INCREASE from 0.01
-  lambda_ss: 0.1         # DECREASE from 0.25
-  lambda_disto: 1.0      # INCREASE from 0.05
-  lambda_rog: 0.0        # Keep at 0.0
+  lambda_distance: 1.0   
+  lambda_3d: 0.1         
+  lambda_ss: 0.1         
+  lambda_disto: 1.0      
+  use_3d_loss: false
 
 inference:
   max_tokens: 750

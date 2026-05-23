@@ -327,7 +327,7 @@ def train_on_synthetic():
         # Slowly introduce 3D loss over first 500 steps
         lambda_3d = min(1.0, step / 500) * 0.1 
 
-        loss_total, mse_trig, mse_dist_1d, loss_3d = end_to_end_loss(
+        loss_total, mse_trig, mse_dist_1d, loss_3d, *_ = end_to_end_loss(
             pred_1d=pred_1d,
             target_angles=angles,
             target_distances=distances,

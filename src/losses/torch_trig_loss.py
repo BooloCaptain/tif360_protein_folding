@@ -9,33 +9,16 @@ def safe_cdist(x, y, eps=1e-8):
     return torch.sqrt(sq_dist + eps)
 
 
-def radius_of_gyration_loss(pred_coords, target_coords, mask_1d):
-    """Computes the Scale-Invariant (Logarithmic) Radius of Gyration loss."""
-    valid_lens = mask_1d.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-8 
-    
-    pred_cog = (pred_coords * mask_1d.unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_lens
-    target_cog = (target_coords * mask_1d.unsqueeze(-1)).sum(dim=1, keepdim=True) / valid_lens
-    
-    pred_sq_dist = ((pred_coords - pred_cog) ** 2).sum(dim=-1) 
-    target_sq_dist = ((target_coords - target_cog) ** 2).sum(dim=-1)
-    
-    pred_rg2 = (pred_sq_dist * mask_1d).sum(dim=1) / valid_lens.squeeze(-1).squeeze(-1)
-    target_rg2 = (target_sq_dist * mask_1d).sum(dim=1) / valid_lens.squeeze(-1).squeeze(-1)
-    
-    pred_rg = torch.sqrt(pred_rg2 + 1e-8)
-    target_rg = torch.sqrt(target_rg2 + 1e-8)
-    
-    return F.mse_loss(torch.log(pred_rg), torch.log(target_rg))
-
-
-def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, target_coords, 
+def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords=None, target_coords=None, 
                     ss_logits=None, target_ss=None, disto_logits=None, 
-                    lambda_dist=1.0, lambda_3d=1.0, lambda_ss=0.5, lambda_disto=0.5, lambda_rog=0.5, 
+                    lambda_dist=1.0, lambda_3d=1.0, lambda_ss=0.5, lambda_disto=0.5, 
                     mask_1d=None, mask_3d=None, mask=None, band_mask_size=30):
     """
     Computes Local (Angle/Dist), Global (3D dRMSD), Auxiliary (SS), and 2D Direct Distogram losses.
     """
     B, L = target_angles.shape[0], target_angles.shape[1]
+    if target_coords is None:
+        raise ValueError("end_to_end_loss requires target_coords.")
 
     # Scrub SCN dataset NaNs BEFORE they touch any mathematical operations
     target_angles = torch.nan_to_num(target_angles, nan=0.0)
@@ -64,15 +47,14 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
     # ==========================================
     # 2. GLOBAL STRUCTURAL LOSS (dRMSD on C-alpha)
     # ==========================================
-    pred_ca = pred_coords
-    target_ca = target_coords
-
-    pred_pdists = safe_cdist(pred_ca, pred_ca)
-    target_pdists = safe_cdist(target_ca, target_ca)
-
-    drmsd_error = torch.abs(pred_pdists - target_pdists)
-    drmsd_error = torch.clamp(drmsd_error, max=10.0)
-    drmsd_unreduced = F.huber_loss(drmsd_error, torch.zeros_like(drmsd_error), reduction='none', delta=2.0)
+    target_pdists = safe_cdist(target_coords, target_coords)
+    if pred_coords is not None:
+        pred_pdists = safe_cdist(pred_coords, pred_coords)
+        drmsd_error = torch.abs(pred_pdists - target_pdists)
+        drmsd_error = torch.clamp(drmsd_error, max=10.0)
+        drmsd_unreduced = F.huber_loss(drmsd_error, torch.zeros_like(drmsd_error), reduction='none', delta=2.0)
+    else:
+        drmsd_unreduced = None
 
     # ==========================================
     # 3. MASKING & REDUCTION
@@ -88,7 +70,7 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
         
         mask_2d = mask_3d.unsqueeze(-1) * mask_3d.unsqueeze(-2) # (B, L, L)
         
-        idx = torch.arange(L, device=pred_coords.device)
+        idx = torch.arange(L, device=pred_1d.device)
         seq_sep = torch.abs(idx.unsqueeze(0) - idx.unsqueeze(1)) # (L, L)
         
         band_mask = (seq_sep < band_mask_size).float().unsqueeze(0) # (1, L, L)
@@ -96,18 +78,25 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
         
         mse_trig_masked = torch.where(mask_1d.bool(), mse_trig_unreduced, 0.0)
         mse_dist_masked = torch.where(mask_1d.bool(), mse_dist_unreduced, 0.0)
-        drmsd_masked = torch.where(mask_2d.bool(), drmsd_unreduced, 0.0)
+        if drmsd_unreduced is not None:
+            drmsd_masked = torch.where(mask_2d.bool(), drmsd_unreduced, 0.0)
         
         valid_tokens_1d = mask_1d.sum() + 1e-8
         valid_pairs_2d = mask_2d.sum() + 1e-8
         
         mse_trig = mse_trig_masked.sum() / valid_tokens_1d
         mse_dist = mse_dist_masked.sum() / valid_tokens_1d
-        loss_3d = drmsd_masked.sum() / valid_pairs_2d
+        if drmsd_unreduced is not None:
+            loss_3d = drmsd_masked.sum() / valid_pairs_2d
+        else:
+            loss_3d = torch.tensor(0.0, device=pred_1d.device)
     else:
         mse_trig = mse_trig_unreduced.mean()
         mse_dist = mse_dist_unreduced.mean()
-        loss_3d = drmsd_unreduced.mean()
+        if drmsd_unreduced is not None:
+            loss_3d = drmsd_unreduced.mean()
+        else:
+            loss_3d = torch.tensor(0.0, device=pred_1d.device)
         mask_2d = torch.ones_like(target_pdists)
 
     # ==========================================
@@ -179,15 +168,11 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords, targe
             valid_pixels = (target_bins_masked != -100)
             loss_disto = weighted_loss[valid_pixels].mean()
             
-
-    loss_rog = radius_of_gyration_loss(pred_coords, target_coords, mask_1d)
-
     # Combine all structural representations
     total_loss = (mse_trig + 
                   (lambda_dist * mse_dist) + 
                   (lambda_3d * loss_3d) + 
                   (lambda_ss * loss_ss) + 
-                  (lambda_disto * loss_disto) +
-                  (lambda_rog * loss_rog))
+                  (lambda_disto * loss_disto))
     
-    return total_loss, mse_trig, mse_dist, loss_3d, loss_ss, loss_disto, loss_rog, target_pdists
+    return total_loss, mse_trig, mse_dist, loss_3d, loss_ss, loss_disto, target_pdists

@@ -12,6 +12,7 @@ from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.data.batching import MaxTokensBatchSampler
 from src.models.transformer import ProteinFoldingNetwork
+from src.models.factory import build_model_from_cfg
 from src.losses.torch_trig_loss import end_to_end_loss
 
 import matplotlib.pyplot as plt
@@ -366,14 +367,9 @@ def main():
     torch.set_float32_matmul_precision('high') # TF32 Speedup
 
     model_cfg = cfg.get("model", {})
-    
+
     # [FIX]: Initialize the unified network
-    model = ProteinFoldingNetwork(
-        d_model=as_int(model_cfg.get("d_model", 128), 128),
-        d_pair=as_int(model_cfg.get("d_pair", 64), 64),
-        nhead=as_int(model_cfg.get("nhead", 4), 4),
-        num_layers=as_int(model_cfg.get("num_layers", 2), 2),
-    ).to(device)
+    model = build_model_from_cfg(model_cfg).to(device)
 
     if cfg.get("compile", False):
         model = torch.compile(model)
@@ -424,7 +420,7 @@ def main():
     lambda_dist_1d = as_float(cfg.get("loss", {}).get("lambda_distance", 1.0), 1.0)
     lambda_ss = as_float(cfg.get("loss", {}).get("lambda_ss", 0.5), 0.5)
     lambda_disto = as_float(cfg.get("loss", {}).get("lambda_disto", 0.5), 0.5)
-    lambda_rog = as_float(cfg.get("loss", {}).get("lambda_rog", 0.5), 0.5)
+    use_3d = bool(cfg.get("loss", {}).get("use_3d_loss", False))
 
     warmup_steps_3d = as_int(cfg.get("training", {}).get("warmup_steps_3d", 500), 500)
     warmup_steps_band_mask = as_int(cfg.get("training", {}).get("warmup_steps_band_mask", 500), 500)
@@ -459,12 +455,10 @@ def main():
     average_3d_loss = 0.0
     average_ss_loss = 0.0
     average_disto_loss = 0.0
-    average_rog_loss = 0.0
 
     for step in range(start_step, total_steps):
         current_lambda_3d = min(1.0, step / warmup_steps_3d) * lambda_3d_base
         current_lambda_disto = min(1.0, step / warmup_steps_3d) * lambda_disto
-        current_lambda_rog = min(1.0, step / warmup_steps_3d) * lambda_rog
         current_band_mask_size = min(max_band_mask_size, int(max_band_mask_size * (step / warmup_steps_band_mask)))
         
         batch = next(infinite_loader)
@@ -485,12 +479,14 @@ def main():
         ss_logits = ss_logits.float()
         disto_logits = disto_logits.float()
         
-        pred_1d_for_3d = pred_1d.clone()
-        pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
+        if use_3d:
+            pred_1d_for_3d = pred_1d.clone()
+            pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
+            pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
+        else:
+            pred_coords = None
         
-        pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
-        
-        loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss, loss_disto, loss_rog, target_pdists = end_to_end_loss(
+        loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss, loss_disto, target_pdists = end_to_end_loss(
             pred_1d=pred_1d, 
             target_angles=angles,
             target_distances=distances,
@@ -503,7 +499,6 @@ def main():
             lambda_3d=current_lambda_3d,
             lambda_ss=lambda_ss,            
             lambda_disto=current_lambda_disto,
-            lambda_rog=current_lambda_rog,
             mask_1d=mask_1d,
             mask_3d=mask_3d,
             band_mask_size=current_band_mask_size
@@ -515,7 +510,6 @@ def main():
         average_3d_loss += loss_3d.item()
         average_ss_loss += loss_ss.item()
         average_disto_loss += loss_disto.item()
-        average_rog_loss += loss_rog.item()
 
         loss_total = loss_total / accumulation_steps
 
@@ -532,13 +526,21 @@ def main():
         if step % 100 == 0:
             current_lr = scheduler.get_last_lr()[0]
             print(f"step={step:5d} lr={current_lr:.6f} loss={average_loss / 100:.4f} "
-                  f"[trig={average_mse_loss / 100:.4f}/{average_mse_loss / 100:.4f} dist1D={average_dist_loss / 100:.4f}/{average_dist_loss*lambda_dist_1d/100:.4f} dRMSD_3D={average_3d_loss / 100:.4f}/{average_3d_loss*current_lambda_3d/100:.4f} ss={average_ss_loss / 100:.4f}/{average_ss_loss*lambda_ss/100:.4f} disto={average_disto_loss / 100:.4f}/{average_disto_loss*current_lambda_disto/100:.4f} rog={average_rog_loss / 100:.4f}/{average_rog_loss*current_lambda_rog/100:.4f}]")
+                f"[trig={average_mse_loss / 100:.4f}/{average_mse_loss / 100:.4f} dist1D={average_dist_loss / 100:.4f}/{average_dist_loss*lambda_dist_1d/100:.4f} dRMSD_3D={average_3d_loss / 100:.4f}/{average_3d_loss*current_lambda_3d/100:.4f} ss={average_ss_loss / 100:.4f}/{average_ss_loss*lambda_ss/100:.4f} disto={average_disto_loss / 100:.4f}/{average_disto_loss*current_lambda_disto/100:.4f}]")
             
             viz_index = 0
             valid_len = int(mask_1d[viz_index].sum().item())
+
+            # Validation/diagnostic path keeps explicit 3D reconstruction even if training 3D loss is disabled.
+            if pred_coords is None:
+                pred_1d_for_eval = pred_1d.clone()
+                pred_1d_for_eval[..., 4] = pred_1d_for_eval[..., 4].detach()
+                pred_coords_eval = angles_to_3d_coords_memory_safe(pred_1d_for_eval, tokens, device)
+            else:
+                pred_coords_eval = pred_coords
             
             true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
-            pred_valid = pred_coords[viz_index, :valid_len].cpu().detach().numpy() 
+            pred_valid = pred_coords_eval[viz_index, :valid_len].cpu().detach().numpy() 
 
             metrics = compute_contiguous_drmsd(
                 pred_ca=pred_valid, 
@@ -593,7 +595,6 @@ def main():
             average_3d_loss = 0.0
             average_ss_loss = 0.0
             average_disto_loss = 0.0
-            average_rog_loss = 0.0
 
         if (step + 1) % checkpoint_interval == 0:
             ckpt_path = train_cfg.get("checkpoint_path", f"checkpoints/phase1_step_{step + 1}.pt")
