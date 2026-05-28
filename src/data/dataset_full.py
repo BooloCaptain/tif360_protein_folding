@@ -41,7 +41,7 @@ class ProteinDataset(Dataset):
       - 'coords': FloatTensor (L,3) C-alpha coordinates
       - 'ss': LongTensor (L,) secondary structure labels
     """
-    def __init__(self, split='test', casp_version=12, thinning=30, max_len=256, raw_data=None, filter_max_len=False, subset_size=None):
+    def __init__(self, split='train', casp_version=12, thinning=30, max_len=256, raw_data=None, filter_max_len=False, subset_size=None):
         """Load real protein dataset from SidechainNet.
         
         Args:

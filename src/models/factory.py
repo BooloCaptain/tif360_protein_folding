@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import esm
 
+from src.models.pair_bias_transformer import PairBiasNetwork
 from src.models.transformer import TransformerBackbone, ProteinFoldingNetwork
 from src.models.heads import build_trig_head
 
@@ -85,6 +86,84 @@ def build_model_from_cfg(cfg: Dict[str, Any]):
 	This function centralizes the mapping from config keys to concrete model
 	constructor arguments. It returns an instantiated model (not moved to any device).
 	"""
+	m = cfg or {}
+	model_cfg = m.get("model", {}) if "model" in m and isinstance(m["model"], dict) else m
+    
+    # ==========================================
+    # [THE OVERRIDE INTERCEPTOR]
+    # ==========================================
+	arch_override = str(model_cfg.get("arch_override", "")).strip().lower()
+    
+	if arch_override == "explainable_pair_bias":
+		print("[INFO] Factory Override: Loading hardcoded ExplainablePairBiasNetwork")
+		return PairBiasNetwork(
+			d_model=int(model_cfg.get("d_model", 256)),
+			nhead=int(model_cfg.get("nhead", 8)),
+			num_layers=int(model_cfg.get("num_layers", 6)),
+			dim_feedforward=int(model_cfg.get("dim_feedforward", 1024)),
+			dropout=float(model_cfg.get("dropout", 0.1)),
+			max_len=int(model_cfg.get("max_len", 4096)),
+			d_pair=int(model_cfg.get("d_pair", 128)),
+			head_hidden=int(model_cfg.get("head_hidden", 128)),
+			num_ss_classes=int(model_cfg.get("num_ss_classes", 3))
+		)
+	elif arch_override == "explainable_two_track":
+		print("[INFO] Factory Override: Loading hardcoded ExplainableTwoTrackNetwork")
+		from src.models.two_track_transformer import TwoTrackNetwork
+		return TwoTrackNetwork(
+			d_model=int(model_cfg.get("d_model", 256)),
+			nhead=int(model_cfg.get("nhead", 8)),
+			num_layers=int(model_cfg.get("num_layers", 6)),
+			dim_feedforward=int(model_cfg.get("dim_feedforward", 1024)),
+			dropout=float(model_cfg.get("dropout", 0.1)),
+			max_len=int(model_cfg.get("max_len", 4096)),
+			d_pair=int(model_cfg.get("d_pair", 128)),
+			head_hidden=int(model_cfg.get("head_hidden", 128)),
+			num_ss_classes=int(model_cfg.get("num_ss_classes", 3))
+		)
+	elif arch_override == "late_branching_network":
+		print("[INFO] Factory Override: Loading hardcoded LateBranchingNetwork")
+		from src.models.late_branching_network import LateBranchingNetwork
+		return LateBranchingNetwork(
+			d_model=int(model_cfg.get("d_model", 256)),
+			nhead=int(model_cfg.get("nhead", 8)),
+			num_layers=int(model_cfg.get("num_layers", 6)),
+			dim_feedforward=int(model_cfg.get("dim_feedforward", 1024)),
+			dropout=float(model_cfg.get("dropout", 0.1)),
+			max_len=int(model_cfg.get("max_len", 4096)),
+			d_pair=int(model_cfg.get("d_pair", 128)),
+			head_hidden=int(model_cfg.get("head_hidden", 128)),
+			num_ss_classes=int(model_cfg.get("num_ss_classes", 3))
+		)
+	elif arch_override == "early_branching_network":
+		print("[INFO] Factory Override: Loading hardcoded EarlyBranchingNetwork")
+		from src.models.early_branching_transformer import EarlyBranchingNetwork
+		return EarlyBranchingNetwork(
+			d_model=int(model_cfg.get("d_model", 256)),
+			nhead=int(model_cfg.get("nhead", 8)),
+			num_layers=int(model_cfg.get("num_layers", 6)),
+			dim_feedforward=int(model_cfg.get("dim_feedforward", 1024)),
+			dropout=float(model_cfg.get("dropout", 0.1)),
+			max_len=int(model_cfg.get("max_len", 4096)),
+			d_pair=int(model_cfg.get("d_pair", 128)),
+			head_hidden=int(model_cfg.get("head_hidden", 128)),
+			num_ss_classes=int(model_cfg.get("num_ss_classes", 3))
+		)
+	
+	elif arch_override == "early_branching_confidence_network":
+		print("[INFO] Factory Override: Loading hardcoded EarlyBranchingConfidenceNetwork")
+		from src.models.early_branching_confidence_transformer import EarlyBranchingConfidenceNetwork
+		return EarlyBranchingConfidenceNetwork(
+			d_model=int(model_cfg.get("d_model", 256)),
+			nhead=int(model_cfg.get("nhead", 8)),
+			num_layers=int(model_cfg.get("num_layers", 6)),
+			dim_feedforward=int(model_cfg.get("dim_feedforward", 1024)),
+			dropout=float(model_cfg.get("dropout", 0.1)),
+			max_len=int(model_cfg.get("max_len", 4096)),
+			d_pair=int(model_cfg.get("d_pair", 128)),
+			head_hidden=int(model_cfg.get("head_hidden", 128)),
+		)
+
 	spec = _spec_from_config(cfg)
 
 	# Build an embedder module according to the requested esm_mode

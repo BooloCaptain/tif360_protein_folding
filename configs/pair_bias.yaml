@@ -1,0 +1,63 @@
+phase: 1
+seed: 42
+device: cuda
+
+data:
+  split: train
+  max_len: 200
+  max_len_valid: 200
+  max_len_test: 4096
+  subset_size_valid: 100
+  subset_size_test: 1000
+  use_sidechainnet_if_available: true
+  dynamic_batching: true
+
+model:
+  arch_override: explainable_pair_bias
+  vocab_size: 33
+  d_model: 256
+  nhead: 8
+  num_layers: 6
+  dim_feedforward: 1024
+  dropout: 0.1
+  max_len: 4096
+  head_hidden: 128
+  d_pair: 128
+
+training:
+  resume_from_checkpoint: false
+  max_tokens: 3333
+  accumulation_steps: 6
+  megabatch_size: 10000
+  lr: 5e-4
+  min_lr_ratio: 0.001
+  total_steps: 4000
+  warmup_steps: 400
+  decay_steps: 4000
+  warmup_steps_3d: 400
+  warmup_steps_band_mask: 400
+  max_band_mask_size: 200
+  logging_interval: 10
+  checkpoint_interval: 500
+  checkpoint_path: checkpoints/pair_bias.pt
+  compile: false
+
+loss:
+  lambda_distance: 1.0   
+  lambda_3d: 0.025
+  lambda_ss: 0.1         
+  lambda_disto: 1.0      
+  use_3d_loss: true
+
+inference:
+  max_tokens: 5000
+  checkpoint_path: checkpoints/pair_bias.pt
+
+postproc:
+  use_nerf: true
+  nerf_impl: mpnerf
+
+export:
+  output_dir: outputs/pair_bias
+  pdb: true
+  gltf: true

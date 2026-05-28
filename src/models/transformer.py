@@ -122,7 +122,7 @@ class TwoTrack_TransformerBlock(nn.Module):
         if padding_mask_bool is not None:
             # padding_mask_bool expects: True = valid token, False = pad
             float_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=x.dtype)
-            float_mask.masked_fill_(~padding_mask_bool, float('-1e9'))
+            float_mask.masked_fill_(~padding_mask_bool, float('-1e4'))
             attn_mask = float_mask if pair_bias is None else pair_bias + float_mask
         else:
             attn_mask = pair_bias
@@ -302,6 +302,9 @@ class ProteinFoldingNetwork(nn.Module):
         else:
             self.disto_head = disto_head
 
+        self.disto_query = nn.Linear(d_model, 64) 
+        self.disto_key = nn.Linear(64, 64)
+
     def forward(self, tokens, src_key_padding_mask=None):
         # Unpack both tracks from the updated backbone
         h, pair_track = self.backbone(tokens, src_key_padding_mask=src_key_padding_mask)
@@ -329,11 +332,33 @@ class ProteinFoldingNetwork(nn.Module):
         disto_logits = (disto_logits + disto_logits.transpose(1, 2)) / 2.0
 
         if self.head_mode in {"hierarchical_ss_disto", "hierarchical_disto", "ss_disto"}:
-            if pair_mask is None:
-                disto_context = disto_logits.mean(dim=2)
-            else:
-                disto_weights = pair_mask.unsqueeze(-1).to(disto_logits.dtype)
-                disto_context = (disto_logits * disto_weights).sum(dim=2) / disto_weights.sum(dim=2).clamp_min(1.0)
+            # 1. Detach disto_logits so gradients don't flow backward from the geometry head 
+            #    and mess up the physical distance training.
+            d_logits_detached = disto_logits.detach()
+            
+            # 2. Convert raw logits to a sharp probability distribution
+            d_probs = F.softmax(d_logits_detached, dim=-1)
+            
+            # [THE FIX]: Spatial Attention Pooling
+            # The 1D track generates a Query. The Distogram generates Keys.
+            q = self.disto_query(h)                # [B, L, 64]
+            k = self.disto_key(d_probs)            # [B, L, L, 64]
+            
+            # Calculate how much Residue `i` should care about the distogram of Residue `j`
+            # [B, L, 1, 64] * [B, L, L, 64] -> sum -> [B, L, L]
+            spatial_attn = (q.unsqueeze(2) * k).sum(dim=-1) 
+            spatial_attn = spatial_attn / math.sqrt(64)
+            
+            if pair_mask is not None:
+                spatial_attn.masked_fill_(~pair_mask, float('-1e4'))
+            
+            spatial_weights = F.softmax(spatial_attn, dim=-1) # [B, L, L]
+            
+            # 3. Apply the weights to the Distogram
+            # We multiply the probabilities by the attention weights, and sum out the `j` dimension
+            # [B, L, L, 1] * [B, L, L, 64] -> sum(dim=2) -> [B, L, 64]
+            disto_context = (spatial_weights.unsqueeze(-1) * d_probs).sum(dim=2)
+            
             pred_1d, ss_logits = self.head(h, disto_context=disto_context)
         else:
             pred_1d, ss_logits = self.head(h)

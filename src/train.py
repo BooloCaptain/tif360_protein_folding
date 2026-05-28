@@ -1,11 +1,15 @@
 import os
+import csv
 import random
 import numpy as np
 import math
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.utils.checkpoint import checkpoint
+from collections import defaultdict
+from torchview import draw_graph
 
 from src.postproc.visualize import kabsch_align, plot_protein_comparison
 from src.utils.config import get_config_from_cli_or_env
@@ -14,6 +18,15 @@ from src.data.batching import MaxTokensBatchSampler
 from src.models.transformer import ProteinFoldingNetwork
 from src.models.factory import build_model_from_cfg
 from src.losses.torch_trig_loss import end_to_end_loss
+from src.utils.structure_eval import (
+    angles_to_3d_coords_memory_safe,
+    calculate_gdt_ts,
+    calculate_steric_clashes,
+    calculate_tm_score,
+    calculate_top_l_half_long_contact_precision,
+    calculate_top_l_half_long_contact_precision_2d,
+    compute_contiguous_drmsd,
+)
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -180,184 +193,197 @@ def get_infinite_batches(loader):
     return iter(loader)
 
 
-def build_ca_coords_nerf(bond_lengths, thetas, phis):
-    """Builds C-alpha coordinates using parallel associative matrix scanning."""
-    bond_lengths = bond_lengths.float()
-    thetas = thetas.float()
-    phis = phis.float()
+def _safe_nanmean(values):
+    if not values:
+        return float('nan')
+    return float(np.nanmean(np.asarray(values, dtype=np.float64)))
 
-    B, L = bond_lengths.shape
-    device = bond_lengths.device
-    dtype = bond_lengths.dtype
 
-    l = bond_lengths.flatten()
-    c_theta = torch.cos(thetas.flatten())
-    s_theta = torch.sin(thetas.flatten())
-    c_phi = torch.cos(phis.flatten())
-    s_phi = torch.sin(phis.flatten())
+def build_valid_eval_loader(cfg):
+    data_cfg = cfg.get("data", {})
+    max_len = as_int(data_cfg.get("max_len_valid", 512), 512)
+    subset_size = data_cfg.get("subset_size_valid", 1)
+    max_len = data_cfg.get("max_len_valid", data_cfg.get("max_len_test", data_cfg.get("max_len", 4096)))
+    batch_size = as_int(data_cfg.get("valid_batch_size", data_cfg.get("eval_batch_size", 4)), 4)
+    num_workers = as_int(data_cfg.get("valid_num_workers", 4), 4)
 
-    tmats = torch.zeros((B * L, 4, 4), device=device, dtype=dtype)
+    ds = ProteinDataset(
+        split="valid-10",
+        casp_version=as_int(data_cfg.get("casp_version", 12), 12),
+        max_len=max_len,
+        subset_size=subset_size,
+        filter_max_len=max_len,
+    )
 
-    tmats[:, 0, 0] = -c_theta
-    tmats[:, 0, 1] = -s_theta
-    tmats[:, 0, 3] = -l * c_theta
-    tmats[:, 1, 3] = l * s_theta * c_phi
-    tmats[:, 2, 3] = l * s_theta * s_phi
+    return DataLoader(
+        ds,
+        collate_fn=collate_fn,
+        batch_size=batch_size,
+        shuffle=False,
+        pin_memory=torch.cuda.is_available(),
+        num_workers=num_workers,
+        persistent_workers=(num_workers > 0),
+    )
 
-    tmats[:, 1, 0] = s_theta * c_phi
-    tmats[:, 1, 1] = -c_theta * c_phi
-    tmats[:, 1, 2] = -s_phi
 
-    tmats[:, 2, 0] = s_theta * s_phi
-    tmats[:, 2, 1] = -c_theta * s_phi
-    tmats[:, 2, 2] = c_phi
+def evaluate_valid_split(model, loader, device, lambda_dist, lambda_3d, lambda_ss, lambda_disto, band_mask_size):
+    was_training = model.training
+    model.eval()
 
-    tmats[:, 3, 3] = 1.0
+    metric_names = [
+        'rmsd', 'gdt_ts', 'tm_score', 'q3', 'full_drmsd', 'helix_drmsd', 'sheet_drmsd',
+        'top_l_3d', 'top_l_2d', 'steric_clashes'
+    ]
+    global_values = {name: [] for name in metric_names}
 
-    tmats = tmats.view(B, L, 4, 4)
+    total_eval_loss = 0.0
+    total_eval_mse_trig = 0.0
+    total_eval_mse_dist = 0.0
+    total_eval_3d = 0.0
+    total_eval_ss = 0.0
+    total_eval_disto = 0.0
+    total_batches = 0
+    total_samples = 0
 
-    # ==========================================
-    # [THE FIX]: Log(N) Parallel Prefix Scan
-    # ==========================================
-    global_tmats = tmats
-    step = 1
-    
-    while step < L:
-        # Take the matrices from earlier in the sequence...
-        left = global_tmats[:, :-step]
-        # ...and multiply them by the matrices further down the sequence.
-        right = global_tmats[:, step:]
-        
-        # torch.matmul perfectly broadcasts over [B, L, 4, 4]
-        updated = torch.matmul(left, right)
-        
-        # We use torch.cat instead of in-place assignment (global_tmats[:, step:] = ...) 
-        # because PyTorch's Autograd engine will crash if we overwrite tensors needed for backprop.
-        global_tmats = torch.cat([global_tmats[:, :step], updated], dim=1)
-        
-        # Double the jump size (1 -> 2 -> 4 -> 8 -> 16...)
-        step *= 2
+    with torch.no_grad():
+        for batch in loader:
+            tokens = batch["tokens"].to(device, non_blocking=True)
+            mask_1d = batch["mask_1d"].to(device, non_blocking=True)
+            mask_3d = batch["mask_3d"].to(device, non_blocking=True)
+            angles = batch["angles"].to(device, non_blocking=True)
+            distances = batch["distances"].to(device, non_blocking=True)
+            padding_mask = batch["pad_mask"].to(device, non_blocking=True)
+            target_coords = batch["coords"].to(device, non_blocking=True)
+            target_ss = batch["target_ss"].to(device, non_blocking=True)
 
-    # ==========================================
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+                pred_1d, ss_logits, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
 
-    origin = torch.tensor([0.0, 0.0, 0.0, 1.0], device=device, dtype=dtype).view(1, 1, 4, 1)
-    ca_coords = torch.matmul(global_tmats, origin)[..., :3, 0]
+                pred_1d = pred_1d.float()
+                ss_logits = ss_logits.float()
+                disto_logits = disto_logits.float()
 
-    return ca_coords
+                pred_1d_for_3d = pred_1d.clone()
+                pred_1d_for_3d[..., 4] = pred_1d_for_3d[..., 4].detach()
+                pred_coords = angles_to_3d_coords_memory_safe(pred_1d_for_3d, tokens, device)
 
-# --- CHECKPOINTED 3D BUILDER WRAPPERS ---
-def build_3d_wrapper(bond_lengths, thetas, phis):
-    return build_ca_coords_nerf(bond_lengths, thetas, phis)
+                loss_total, mse_trig, mse_dist_1d, loss_3d, loss_ss, loss_disto, target_pdists = end_to_end_loss(
+                    pred_1d=pred_1d,
+                    target_angles=angles,
+                    target_distances=distances,
+                    pred_coords=pred_coords,
+                    target_coords=target_coords,
+                    ss_logits=ss_logits,
+                    target_ss=target_ss,
+                    disto_logits=disto_logits,
+                    lambda_dist=lambda_dist,
+                    lambda_3d=lambda_3d,
+                    lambda_ss=lambda_ss,
+                    lambda_disto=lambda_disto,
+                    mask_1d=mask_1d,
+                    mask_3d=mask_3d,
+                    band_mask_size=band_mask_size,
+                )
 
-def angles_to_3d_coords_memory_safe(pred_1d, sequences, device):
-    B, L = sequences.shape
-    bond_lengths = pred_1d[..., 4]
-    
-    # Extract explicitly from the flat tensor to avoid dimension traps
-    # pred_1d layout: [sin_theta, cos_theta, sin_phi, cos_phi, length]
-    theta_sin = pred_1d[..., 0]
-    theta_cos = pred_1d[..., 1]
-    phi_sin = pred_1d[..., 2]
-    phi_cos = pred_1d[..., 3]
-    
-    # torch.atan2(y, x) -> atan2(sin, cos)
-    thetas = torch.atan2(theta_sin, theta_cos)
-    phis = torch.atan2(phi_sin, phi_cos)
-    
-    pred_coords = checkpoint(build_3d_wrapper, bond_lengths, thetas, phis, use_reentrant=False)
-    return pred_coords
+            total_eval_loss += loss_total.item()
+            total_eval_mse_trig += mse_trig.item()
+            total_eval_mse_dist += mse_dist_1d.item()
+            total_eval_3d += loss_3d.item()
+            total_eval_ss += loss_ss.item()
+            total_eval_disto += loss_disto.item()
+            total_batches += 1
 
-import torch
+            pred_coords_cpu = pred_coords.float().cpu().numpy()
+            ss_logits_cpu = torch.argmax(ss_logits, dim=-1).cpu().numpy()
+            target_coords_cpu = target_coords.cpu().numpy()
+            target_ss_cpu = target_ss.cpu().numpy()
+            mask_1d_cpu = mask_1d.cpu().numpy()
 
-def compute_contiguous_drmsd(pred_ca, target_ca, target_ss, valid_mask, helix_idx=0, sheet_idx=1):
-    """
-    Evaluates local secondary structure distance MAE within contiguous blocks.
-    Universally compatible with both Training (Tensors) and Evaluation (NumPy).
-    Expects single-protein inputs (no batch dimension).
-    """
-    # 1. Universally convert inputs to PyTorch Tensors
-    if isinstance(pred_ca, np.ndarray):
-        pred_ca = torch.from_numpy(pred_ca)
-    if isinstance(target_ca, np.ndarray):
-        target_ca = torch.from_numpy(target_ca)
-    if isinstance(target_ss, np.ndarray):
-        target_ss = torch.from_numpy(target_ss)
-    if isinstance(valid_mask, np.ndarray):
-        valid_mask = torch.from_numpy(valid_mask)
-        
-    # 2. Align devices and types (safeguard for training loop)
-    device = pred_ca.device
-    pred_ca = pred_ca.float()
-    target_ca = target_ca.to(device).float()
-    target_ss = target_ss.to(device).long()
-    valid_mask = valid_mask.to(device).bool()
+            disto_logits_gpu = disto_logits.detach()
 
-    # 3. Truncate to sequence length
-    L = pred_ca.shape[0]
-    target_ss = target_ss[:L]
-    valid_mask = valid_mask[:L]
+            B = tokens.shape[0]
+            for b in range(B):
+                L = int(batch["lengths"][b])
+                pred_np = pred_coords_cpu[b, :L, :]
+                target_coords_np = target_coords_cpu[b, :L, :3]
+                ss_pred_labels = ss_logits_cpu[b, :L]
+                target_ss_labels = target_ss_cpu[b, :L]
+                mask_1d_np = mask_1d_cpu[b, :L]
+                valid_mask = (mask_1d_np > 0) & ~np.isnan(target_coords_np).any(axis=1)
+                valid_len = int(valid_mask.sum())
+                if valid_len < 15:
+                    continue
 
-    # 4. Full Sequence dRMSD
-    valid_idx_full = torch.where(valid_mask)[0]
-    if len(valid_idx_full) > 0:
-        p_sub = pred_ca[valid_idx_full]
-        t_sub = target_ca[valid_idx_full]
-        full_err = torch.abs(torch.cdist(p_sub, p_sub) - torch.cdist(t_sub, t_sub)).sum().item()
-        full_drmsd = full_err / (len(valid_idx_full) ** 2)
-    else:
-        full_drmsd = float('nan')
+                eval_pred_coords = pred_np[valid_mask]
+                eval_true_coords = target_coords_np[valid_mask]
 
-    # 5. Extract blocks safely using lists (fastest for sequential iteration)
-    def get_blocks(class_idx):
-        blocks = []
-        curr = []
-        # Move to CPU for fast python loop iteration
-        ts_list = target_ss.cpu().tolist()
-        vm_list = valid_mask.cpu().tolist()
-        
-        for i, (val, is_valid) in enumerate(zip(ts_list, vm_list)):
-            if val == class_idx and is_valid:
-                curr.append(i)
-            else:
-                if len(curr) >= 4:  # Must be at least 4 residues to form a meaningful structure
-                    blocks.append(curr)
-                curr = []
-        if len(curr) >= 4:
-            blocks.append(curr)
-        return blocks
+                if np.isnan(eval_pred_coords).any() or np.isinf(eval_pred_coords).any():
+                    print(f"Skipping Kabsch for a NaN prediction...")
+                    continue # Skip Kabsch and move to the next valid protein
 
-    # 6. Evaluate blocks dynamically on the GPU
-    def evaluate_blocks(blocks):
-        if not blocks: 
-            return float('nan') # Safe for both np.nanmean and PyTorch logging
-            
-        total_error = 0.0
-        total_pairs = 0
-        
-        for block in blocks:
-            idx = torch.tensor(block, device=device)
-            p_sub = pred_ca[idx]
-            t_sub = target_ca[idx]
-            
-            p_dist = torch.cdist(p_sub, p_sub)
-            t_dist = torch.cdist(t_sub, t_sub)
-            
-            error = torch.abs(p_dist - t_dist)
-            total_error += error.sum().item()
-            total_pairs += error.numel()
-            
-        return total_error / total_pairs if total_pairs > 0 else float('nan')
+                aligned_pred_coords = kabsch_align(eval_true_coords, eval_pred_coords)
 
-    helix_blocks = get_blocks(helix_idx)
-    sheet_blocks = get_blocks(sheet_idx)
+                rmsd_val = float(np.sqrt(np.mean(((aligned_pred_coords - eval_true_coords) ** 2).sum(axis=-1))))
+                gdt_val = calculate_gdt_ts(aligned_pred_coords, eval_true_coords)
+                tm_val = calculate_tm_score(aligned_pred_coords, eval_true_coords)
+                q3_val = float(np.mean(ss_pred_labels[valid_mask] == target_ss_labels[valid_mask]))
+                top_l_prec_3d = calculate_top_l_half_long_contact_precision(eval_pred_coords, eval_true_coords)
 
-    return {
-        'full_drmsd': full_drmsd,
-        'intra_helix_drmsd': evaluate_blocks(helix_blocks),
-        'intra_sheet_drmsd': evaluate_blocks(sheet_blocks),
-        'helix_count': len(helix_blocks),
-        'sheet_count': len(sheet_blocks)
+                viz_disto_logits = disto_logits_gpu[b, :L, :L]
+                
+                viz_probs = F.softmax(viz_disto_logits.float(), dim=-1)
+                
+                contact_probs_gpu = viz_probs[:, :, 0:20].sum(dim=-1)
+                
+                contact_probs = contact_probs_gpu.cpu().numpy()
+                
+                top_l_prec_2d = calculate_top_l_half_long_contact_precision_2d(
+                    contact_probs=contact_probs[valid_mask][:, valid_mask],
+                    target_coords=eval_true_coords,
+                )
+
+                contiguous_metrics = compute_contiguous_drmsd(
+                    pred_ca=eval_pred_coords,
+                    target_ca=eval_true_coords,
+                    target_ss=target_ss_labels[valid_mask],
+                    valid_mask=np.ones(valid_len, dtype=np.float32),
+                )
+                steric_clashes = calculate_steric_clashes(eval_pred_coords)
+
+                sample_metrics = {
+                    'rmsd': rmsd_val,
+                    'gdt_ts': gdt_val,
+                    'tm_score': tm_val,
+                    'q3': q3_val,
+                    'full_drmsd': contiguous_metrics['full_drmsd'],
+                    'helix_drmsd': contiguous_metrics['intra_helix_drmsd'],
+                    'sheet_drmsd': contiguous_metrics['intra_sheet_drmsd'],
+                    'top_l_3d': top_l_prec_3d,
+                    'top_l_2d': top_l_prec_2d,
+                    'steric_clashes': steric_clashes,
+                }
+
+                for metric_name, metric_value in sample_metrics.items():
+                    global_values[metric_name].append(metric_value)
+                total_samples += 1
+
+    summary = {
+        'val_loss_total': total_eval_loss / max(1, total_batches),
+        'val_mse_trig': total_eval_mse_trig / max(1, total_batches),
+        'val_mse_dist': total_eval_mse_dist / max(1, total_batches),
+        'val_3d_loss': total_eval_3d / max(1, total_batches),
+        'val_ss_loss': total_eval_ss / max(1, total_batches),
+        'val_disto_loss': total_eval_disto / max(1, total_batches),
+        'val_samples': total_samples,
     }
+
+    for metric_name in metric_names:
+        summary[f'val_{metric_name}'] = _safe_nanmean(global_values[metric_name])
+
+    if was_training:
+        model.train()
+
+    return summary
 
 
 def main():
@@ -368,6 +394,25 @@ def main():
 
     model_cfg = cfg.get("model", {})
     model = build_model_from_cfg(model_cfg).to(device)
+
+    def register_explosion_hooks(model):
+        """Attaches a sensor to every layer to warn you BEFORE a NaN happens."""
+        def check_tensor_health(module, input, output):
+            if isinstance(output, torch.Tensor):
+                max_val = output.abs().max().item()
+                # If a tensor exceeds 50 in bfloat16, it is about to explode.
+                if max_val > 50.0:
+                    print(f"[WARNING] Variance Leak: {module.__class__.__name__} output max is {max_val:.2f}!")
+                if torch.isnan(output).any():
+                    print(f"[FATAL] NaN generated directly inside: {module.__class__.__name__}")
+                    raise RuntimeError("Caught forward NaN")
+
+        for name, layer in model.named_modules():
+            # Attach the hook to all Linear layers, LayerNorms, and Attention
+            if isinstance(layer, (nn.Linear, nn.LayerNorm, nn.Embedding)):
+                layer.register_forward_hook(check_tensor_health)
+
+    #register_explosion_hooks(model)
 
     if cfg.get("compile", False):
         model = torch.compile(model)
@@ -408,6 +453,30 @@ def main():
     
     loader = build_loader(cfg)
     infinite_loader = get_infinite_batches(loader)
+    valid_eval_loader = build_valid_eval_loader(cfg)
+
+    output_dir = cfg.get("export", {}).get("output_dir", "outputs")
+    os.makedirs(output_dir, exist_ok=True)
+    metrics_csv_path = train_cfg.get("metrics_csv_path", os.path.join(output_dir, "training_metrics.csv"))
+    os.makedirs(os.path.dirname(metrics_csv_path) or ".", exist_ok=True)
+    metrics_csv_needs_header = not os.path.exists(metrics_csv_path)
+    metrics_csv_fh = open(metrics_csv_path, "a", newline="")
+    metrics_csv_writer = None
+
+    dummy_tokens = torch.randint(0, 20, (1, 256))
+    dummy_mask = torch.zeros((1, 256), dtype=torch.bool)
+
+    model_graph = draw_graph(
+        model, 
+        input_data=(dummy_tokens, dummy_mask),
+        graph_name="ProteinFoldingNetwork",
+        save_graph=True,
+        filename=f"{output_dir}/network_architecture",
+        expand_nested=True, # Set to False if you want a high-level view
+        hide_inner_tensors=True,
+        hide_module_functions=True,
+        roll=True,
+    )
 
     model.train()
 
@@ -420,6 +489,7 @@ def main():
     warmup_steps_3d = as_int(cfg.get("training", {}).get("warmup_steps_3d", 500), 500)
     warmup_steps_band_mask = as_int(cfg.get("training", {}).get("warmup_steps_band_mask", 500), 500)
     max_band_mask_size = as_int(cfg.get("training", {}).get("max_band_mask_size", 30), 30)
+    valid_eval_interval = as_int(train_cfg.get("valid_eval_interval", logging_interval), logging_interval)
 
     optimizer.zero_grad(set_to_none=True)
 
@@ -534,19 +604,26 @@ def main():
                 average_length = valid_tokens_in_batch / mask_1d.shape[0]
                 current_lr = scheduler.get_last_lr()[0]
                 
-                # Because we accumulate over 100 global steps * accumulation_steps, 
-                # we must divide by the total number of batches to get the true average
-                log_div = 100 * accumulation_steps
-                
+                log_div = max(1, logging_interval * accumulation_steps)
+
+                train_stats = {
+                    'train_loss': average_loss / log_div,
+                    'train_mse_trig': average_mse_loss / log_div,
+                    'train_mse_dist': average_dist_loss / log_div,
+                    'train_3d_loss': average_3d_loss / log_div,
+                    'train_ss_loss': average_ss_loss / log_div,
+                    'train_disto_loss': average_disto_loss / log_div,
+                }
+
                 print(f"Global Step: {global_step:5d} | Tokens Seen: {total_tokens_seen / 1e6:.2f}M | "
                       f"avg_len={average_length:.0f} | lr={current_lr:.6f} | "
-                      f"loss={average_loss / log_div:.4f} "
-                      f"[trig={average_mse_loss / log_div:.4f} "
-                      f"dist1D={average_dist_loss / log_div:.4f} "
-                      f"dRMSD_3D={average_3d_loss / log_div:.4f} "
-                      f"ss={average_ss_loss / log_div:.4f} "
-                      f"disto={average_disto_loss / log_div:.4f}]")
-                
+                      f"loss={train_stats['train_loss']:.4f} "
+                      f"[trig={train_stats['train_mse_trig']:.4f} "
+                      f"dist1D={train_stats['train_mse_dist']:.4f} "
+                      f"dRMSD_3D={train_stats['train_3d_loss']:.4f} "
+                      f"ss={train_stats['train_ss_loss']:.4f} "
+                      f"disto={train_stats['train_disto_loss']:.4f}]")
+
                 # Reset accumulators
                 average_loss = 0.0
                 average_mse_loss = 0.0
@@ -567,17 +644,7 @@ def main():
                     pred_coords_eval = pred_coords
                 
                 true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
-                pred_valid = pred_coords_eval[viz_index, :valid_len].cpu().detach().numpy() 
-
-                metrics = compute_contiguous_drmsd(
-                    pred_ca=pred_valid, 
-                    target_ca=true_valid, 
-                    target_ss=target_ss[viz_index, :valid_len].cpu().numpy(),
-                    valid_mask=mask_1d[viz_index, :valid_len].cpu().numpy()
-                )
-
-                print(f"Diagnostics -> Helix Error: {metrics['intra_helix_drmsd']:.2f}A | "
-                      f"Sheet Error: {metrics['intra_sheet_drmsd']:.2f}A | ")
+                pred_valid = pred_coords_eval[viz_index, :valid_len].cpu().detach().float().numpy()
                 
                 if disto_logits is not None:
                     probs = F.softmax(disto_logits[viz_index, :valid_len, :valid_len].detach(), dim=-1)
@@ -591,7 +658,7 @@ def main():
                     viz_true_ss = target_ss[viz_index, :valid_len].cpu().numpy()
                     viz_pred_ss = ss_logits[viz_index, :valid_len].detach().argmax(dim=-1).cpu().numpy()
                     
-                    disto_save_path = f"outputs/full_eval/disto_step_{global_step:06d}.png"
+                    disto_save_path = f"{output_dir}/disto_step_{global_step:06d}.png"
                     
                     plot_distograms(
                         pred_disto=expected_bins, 
@@ -605,8 +672,47 @@ def main():
                     true_coords=true_valid, 
                     pred_coords=pred_valid, 
                     title=f"Global Step {global_step} (Tokens: {total_tokens_seen / 1e6:.2f}M)",
-                    filename=f"outputs/full_eval/train_step_{global_step:06d}.html"
+                    filename=f"{output_dir}/train_step_{global_step:06d}.html"
                 )
+
+                eval_summary = None
+                if global_step % valid_eval_interval == 0:
+                    eval_summary = evaluate_valid_split(
+                        model=model,
+                        loader=valid_eval_loader,
+                        device=device,
+                        lambda_dist=lambda_dist_1d,
+                        lambda_3d=current_lambda_3d,
+                        lambda_ss=lambda_ss,
+                        lambda_disto=current_lambda_disto,
+                        band_mask_size=current_band_mask_size,
+                    )
+
+                    print(
+                        f"VALID valid-10 | n={eval_summary['val_samples']:4d} | "
+                        f"loss={eval_summary['val_loss_total']:.4f} | "
+                        f"rmsd={eval_summary['val_rmsd']:.3f} | dRMSD={eval_summary['val_full_drmsd']:.3f} | "
+                        f"helix_dRMSD={eval_summary['val_helix_drmsd']:.3f} | sheet_dRMSD={eval_summary['val_sheet_drmsd']:.3f} | "
+                        f"TM={eval_summary['val_tm_score']:.4f} | GDT_TS={eval_summary['val_gdt_ts']:.4f} | "
+                        f"Q3={eval_summary['val_q3']*100:.2f}% | "
+                        f"TopL/2-3D={eval_summary['val_top_l_3d']*100:.2f}% | TopL/2-2D={eval_summary['val_top_l_2d']*100:.2f}% | "
+                        f"clashes={eval_summary['val_steric_clashes']:.2f}"
+                    )
+
+                    csv_row = {
+                        'global_step': global_step,
+                        'total_tokens_seen': total_tokens_seen,
+                    }
+                    # Use the captured train_stats recorded before accumulators reset
+                    csv_row.update(train_stats)
+                    csv_row.update(eval_summary)
+
+                    if metrics_csv_writer is None:
+                        metrics_csv_writer = csv.DictWriter(metrics_csv_fh, fieldnames=list(csv_row.keys()))
+                        if metrics_csv_needs_header:
+                            metrics_csv_writer.writeheader()
+                    metrics_csv_writer.writerow(csv_row)
+                    metrics_csv_fh.flush()
 
             # --- CHECKPOINTING ---
             if global_step % checkpoint_interval == 0:
@@ -629,6 +735,8 @@ def main():
                 print(f"[INFO] Saved robust checkpoint at Global Step {global_step} | Tokens: {total_tokens_seen / 1e6:.2f}M")
                 
         batch_idx += 1
+
+    metrics_csv_fh.close()
 
 if __name__ == "__main__":
     main()

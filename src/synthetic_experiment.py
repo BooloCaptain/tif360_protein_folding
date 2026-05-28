@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.checkpoint import checkpoint
+from src.utils.structure_eval import angles_to_3d_coords_memory_safe
 
 # --- LOCAL IMPORTS (Ensure these exist in your repository) ---
 from postproc.visualize import kabsch_align, plot_protein_comparison
@@ -31,49 +31,17 @@ SYNTH_CONFIG = {
     "lr": 3e-4,             # Safe Transformer learning rate
     "viz_interval": 100,
     "out_dir": "outputs/synthetic_eval",
-}
 
 # ==========================================
 # 1. MODEL ARCHITECTURE
 # ==========================================
 
 class TrigDistanceHead(nn.Module):
-    def __init__(self, d_model, hidden=128):
-        super().__init__()
-        self.proj = nn.Linear(d_model, hidden)
-        self.out = nn.Linear(hidden, 5)
-        
-        # [FIX]: Initialize weights to zero and bias to biologically realistic defaults
-        # [sin_theta(0), cos_theta(1), sin_phi(0), cos_phi(1), softplus_inverse(3.8)]
-        nn.init.zeros_(self.out.weight)
-        self.out.bias.data = torch.tensor([0.0, 1.0, 0.0, 1.0, 3.77])
-
-    def forward(self, h):
-        # [FIX]: Use GELU to prevent dead gradients from negative initializations
-        x = F.gelu(self.proj(h))
-        out = self.out(x)
-        d_pos = F.softplus(out[..., 4:5])
-        return torch.cat([out[..., 0:4], d_pos], dim=-1)
-
-def precompute_freqs(dim, max_len=4096, theta=10000.0):
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(max_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.cos(freqs), torch.sin(freqs)
-
-def apply_rotary_emb(x, cos, sin):
-    x1, x2 = x.chunk(2, dim=-1)
-    rotated = torch.cat([-x2, x1], dim=-1)
-    cos = cos.unsqueeze(0).unsqueeze(2)
-    sin = sin.unsqueeze(0).unsqueeze(2)
-    cos = torch.cat([cos, cos], dim=-1)
-    sin = torch.cat([sin, sin], dim=-1)
-    return x * cos + rotated * sin
-
-class TwoTrack_TransformerBlock(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout, d_pair=64):
-        super().__init__()
-        self.nhead = nhead
+    def angles_to_3d_coords_memory_safe(pred_1d, sequences, device):
+        bond_lengths = pred_1d[..., 4]
+        thetas = torch.atan2(pred_1d[..., 0], pred_1d[..., 1])
+        phis = torch.atan2(pred_1d[..., 2], pred_1d[..., 3])
+        return checkpoint(build_ca_coords_nerf, bond_lengths, thetas, phis, use_reentrant=False)
         self.head_dim = d_model // nhead
         self.norm1 = nn.LayerNorm(d_model)
         self.qkv = nn.Linear(d_model, d_model * 3)
@@ -233,41 +201,6 @@ class SyntheticDataset(Dataset):
         distances[mask == 0] = 0.0
         
         return {'tokens': tokens, 'mask': mask, 'angles': angles, 'distances': distances, 'coords': coords}
-
-def build_ca_coords_nerf(bond_lengths, thetas, phis):
-    """[FIX]: Parallel associative matrix scanning for O(1) gradient depth."""
-    bond_lengths, thetas, phis = bond_lengths.float(), thetas.float(), phis.float()
-    B, L = bond_lengths.shape
-    device, dtype = bond_lengths.device, bond_lengths.dtype
-
-    l = bond_lengths.flatten()
-    c_theta, s_theta = torch.cos(thetas.flatten()), torch.sin(thetas.flatten())
-    c_phi, s_phi = torch.cos(phis.flatten()), torch.sin(phis.flatten())
-
-    tmats = torch.zeros((B * L, 4, 4), device=device, dtype=dtype)
-    tmats[:, 0, 0], tmats[:, 0, 1], tmats[:, 0, 3] = -c_theta, -s_theta, -l * c_theta
-    tmats[:, 1, 3], tmats[:, 2, 3] = l * s_theta * c_phi, l * s_theta * s_phi
-    tmats[:, 1, 0], tmats[:, 1, 1], tmats[:, 1, 2] = s_theta * c_phi, -c_theta * c_phi, -s_phi
-    tmats[:, 2, 0], tmats[:, 2, 1], tmats[:, 2, 2] = s_theta * s_phi, -c_theta * s_phi, c_phi
-    tmats[:, 3, 3] = 1.0
-    tmats = tmats.view(B, L, 4, 4)
-
-    global_tmats = tmats
-    step = 1
-    while step < L:
-        left, right = global_tmats[:, :-step], global_tmats[:, step:]
-        updated = torch.matmul(left, right)
-        global_tmats = torch.cat([global_tmats[:, :step], updated], dim=1)
-        step *= 2
-
-    origin = torch.tensor([0.0, 0.0, 0.0, 1.0], device=device, dtype=dtype).view(1, 1, 4, 1)
-    return torch.matmul(global_tmats, origin)[..., :3, 0]
-
-def angles_to_3d_coords_memory_safe(pred_1d, sequences, device):
-    bond_lengths = pred_1d[..., 4]
-    thetas = torch.atan2(pred_1d[..., 0], pred_1d[..., 1])
-    phis = torch.atan2(pred_1d[..., 2], pred_1d[..., 3])
-    return checkpoint(build_ca_coords_nerf, bond_lengths, thetas, phis, use_reentrant=False)
 
 # ==========================================
 # 3. MAIN TRAINING LOOP

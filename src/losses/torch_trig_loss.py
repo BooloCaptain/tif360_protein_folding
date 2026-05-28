@@ -3,7 +3,6 @@ import torch.nn.functional as F
 
 def safe_cdist(x, y, eps=1e-8):
     """Computes pairwise distance avoiding NaN gradients at exactly 0."""
-    # [FIX 2]: Adds epsilon before sqrt to prevent division by zero in backward pass
     diff = x.unsqueeze(2) - y.unsqueeze(1) # (B, L, L, 3)
     sq_dist = (diff ** 2).sum(dim=-1)
     return torch.sqrt(sq_dist + eps)
@@ -47,9 +46,10 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords=None, 
     # ==========================================
     # 2. GLOBAL STRUCTURAL LOSS (dRMSD on C-alpha)
     # ==========================================
-    target_pdists = safe_cdist(target_coords, target_coords)
+    # [THE FIX]: Upcast coordinates to float32 before squaring/rooting to prevent variance explosions in the 3D loss
+    target_pdists = safe_cdist(target_coords.float(), target_coords.float())
     if pred_coords is not None:
-        pred_pdists = safe_cdist(pred_coords, pred_coords)
+        pred_pdists = safe_cdist(pred_coords.float(), pred_coords.float())
         drmsd_error = torch.abs(pred_pdists - target_pdists)
         drmsd_error = torch.clamp(drmsd_error, max=10.0)
         drmsd_unreduced = F.huber_loss(drmsd_error, torch.zeros_like(drmsd_error), reduction='none', delta=2.0)
@@ -109,8 +109,9 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords=None, 
             target_ss_masked[mask_1d == 0] = 3
             
         if (target_ss_masked != 3).any():
+            # [THE FIX]: Cast the logits to float32 before they hit the Softmax exponentiation
             loss_ss = F.cross_entropy(
-                ss_logits.reshape(-1, 3),
+                ss_logits.float().reshape(-1, 3),
                 target_ss_masked.reshape(-1), 
                 ignore_index=3,
                 label_smoothing=0.1
@@ -134,8 +135,9 @@ def end_to_end_loss(pred_1d, target_angles, target_distances, pred_coords=None, 
             B, L, _ = target_bins_masked.shape
             
             # 1. Calculate Unreduced Loss [B, L, L]
+            # [THE FIX]: Cast the logits to float32 before they hit the Softmax exponentiation
             raw_disto_loss = F.cross_entropy(
-                disto_logits.permute(0, 3, 1, 2), 
+                disto_logits.float().permute(0, 3, 1, 2), 
                 target_bins_masked, 
                 ignore_index=-100,
                 reduction='none' 
