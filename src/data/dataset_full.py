@@ -371,7 +371,8 @@ def ca_to_internal_targets(ca_coords):
     """Compute coarse-grained targets from C-alpha coordinates.
 
     Returns:
-    - angles: (L, 2) where [:,0] is theta (bond angle), [:,1] is tau (dihedral)
+        - angles: (L, 4) where the last dimension is
+            (sin_theta, cos_theta, sin_tau, cos_tau)
     - distances: (L,) where i stores |CA_i - CA_{i-1}|
     """
     ca = np.asarray(ca_coords, dtype=np.float32)
@@ -403,7 +404,12 @@ def ca_to_internal_targets(ca_coords):
         tau[1] = tau[3]
         tau[2] = tau[3]
 
-    angles = np.stack([theta, tau], axis=-1)
+    theta_sin = np.sin(theta).astype(np.float32)
+    theta_cos = np.cos(theta).astype(np.float32)
+    tau_sin = np.sin(tau).astype(np.float32)
+    tau_cos = np.cos(tau).astype(np.float32)
+
+    angles = np.stack([theta_sin, theta_cos, tau_sin, tau_cos], axis=-1).astype(np.float32)
     return angles, distances
 
 
@@ -421,7 +427,7 @@ def collate_fn(batch: List[dict]):
     mask_1d = torch.zeros((batch_size, max_len), dtype=torch.float32)
     mask_3d = torch.zeros((batch_size, max_len), dtype=torch.float32)
     
-    angles = torch.zeros((batch_size, max_len, 2), dtype=torch.float32)
+    angles = torch.zeros((batch_size, max_len, 4), dtype=torch.float32)
     distances = torch.zeros((batch_size, max_len), dtype=torch.float32)
     coords = torch.zeros((batch_size, max_len, 3), dtype=torch.float32)
     pad_mask = torch.ones((batch_size, max_len), dtype=torch.bool)

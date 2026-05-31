@@ -8,23 +8,6 @@ import esm
 # ==========================================
 # 1. HELPER FUNCTIONS
 # ==========================================
-def precompute_freqs(dim, max_len=4096, theta=10000.0):
-    """Precomputes Rotary Positional Embedding frequencies."""
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(max_len, dtype=torch.float32)
-    freqs = torch.outer(t, freqs)
-    return torch.cos(freqs), torch.sin(freqs)
-
-def apply_rotary_emb(x, cos, sin):
-    """Applies Rotary Positional Embeddings to Q and K tensors."""
-    x1, x2 = x.chunk(2, dim=-1)
-    rotated = torch.cat([-x2, x1], dim=-1)
-    cos = cos.unsqueeze(0).unsqueeze(2)
-    sin = sin.unsqueeze(0).unsqueeze(2)
-    cos = torch.cat([cos, cos], dim=-1)
-    sin = torch.cat([sin, sin], dim=-1)
-    return x * cos + rotated * sin
-
 def _init_gaussian_geometry_bias(out_layer: nn.Linear) -> None:
     """
     Initializes the output layer with standard physical defaults for a Gaussian formulation.
@@ -76,7 +59,7 @@ class FrozenESMEmbedder(nn.Module):
 # 3. BACKBONE (PURE 1D SEQUENCE)
 # ==========================================
 class OneDTransformerBlock(nn.Module):
-    """A pure 1D Transformer block using RoPE and QK-Norm. Highly efficient."""
+    """A pure 1D Transformer block. Relies on ESM-2 for positional embeddings."""
     def __init__(self, d_model=256, nhead=8, dim_feedforward=1024, dropout=0.1):
         super().__init__()
         self.nhead = nhead
@@ -105,14 +88,21 @@ class OneDTransformerBlock(nn.Module):
         qkv = self.qkv(h).reshape(B, L, 3, self.nhead, self.head_dim)
         q, k, v = qkv.unbind(2)
 
+        # 1. Normalize FIRST (Establishes the geometric space)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        # 2. Rotate SECOND (Embeds the pure angular frequencies)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
 
-        q = self.q_norm(q).transpose(1, 2)
-        k = self.k_norm(k).transpose(1, 2)
+        # 3. Transpose THIRD (Preps for Attention [B, nhead, L, head_dim])
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
         if padding_mask_bool is not None:
+            # Standard, memory-efficient 1D PyTorch Padding Mask
             attn_mask = torch.zeros(B, 1, 1, L, device=x.device, dtype=x.dtype)
             attn_mask.masked_fill_(~padding_mask_bool, float('-1e4'))
         else:
@@ -125,6 +115,17 @@ class OneDTransformerBlock(nn.Module):
         x = x + self.ffn(self.norm2(x))
 
         return x
+    
+
+def apply_rotary_emb(x, cos, sin):
+    """Applies Rotary Positional Embeddings to Q and K tensors."""
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat([-x2, x1], dim=-1)
+    cos = cos.unsqueeze(0).unsqueeze(2)
+    sin = sin.unsqueeze(0).unsqueeze(2)
+    cos = torch.cat([cos, cos], dim=-1)
+    sin = torch.cat([sin, sin], dim=-1)
+    return x * cos + rotated * sin
 
 
 # ==========================================
@@ -153,7 +154,6 @@ class SpatialAttentionPooler(nn.Module):
         self.bins = bins
 
     def forward(self, h, d_probs, pair_mask=None):
-        # 1D Sequence creates Queries, 2D Distogram creates Keys
         q = self.disto_query(h)       # [B, L, 64]
         k = self.disto_key(d_probs)   # [B, L, L, 64]
         
@@ -180,36 +180,17 @@ class GaussianGeometryHead(nn.Module):
         x = F.gelu(self.geom_proj(h_conditioned))
         out = self.geom_out(x)
 
-        # Split outputs into means and log-variances
-        mu_theta = out[..., 0:2]
+        mu_theta = F.normalize(out[..., 0:2], p=2, dim=-1)
         log_var_theta = out[..., 2:3]
         
-        mu_tau = out[..., 3:5]
+        mu_tau = F.normalize(out[..., 3:5], p=2, dim=-1)
         log_var_tau = out[..., 5:6]
         
-        # Distance must be strictly positive, so we use softplus on the mean
         mu_d = F.softplus(out[..., 6:7])
         log_var_d = out[..., 7:8]
 
         pred_1d = torch.cat([mu_theta, log_var_theta, mu_tau, log_var_tau, mu_d, log_var_d], dim=-1)
         return pred_1d
-
-
-class pLDDTHead(nn.Module):
-    """Predicts the Local Distance Difference Test (pLDDT) confidence score."""
-    def __init__(self, d_model=256, hidden=128):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            nn.GELU(),
-            nn.LayerNorm(hidden),
-            nn.Linear(hidden, 1),
-            nn.Sigmoid() # Bounds the output between 0 and 1
-        )
-
-    def forward(self, x):
-        # Scale the Sigmoid output to a standard 0-100 pLDDT score range
-        return self.mlp(x).squeeze(-1) * 100.0
 
 
 # ==========================================
@@ -218,7 +199,8 @@ class pLDDTHead(nn.Module):
 class EarlyBranchingConfidenceNetwork(nn.Module):
     """
     The fast, Early-Branching 1D architecture.
-    Features a pure 1D backbone, detached pLDDT auditor, and a Gaussian output head.
+    Restored early 2D extraction with gradient detachment for maximum multi-task performance.
+    pLDDT has been completely removed.
     """
     def __init__(
         self,
@@ -241,15 +223,21 @@ class EarlyBranchingConfidenceNetwork(nn.Module):
         # 2. Early 2D Feature Extraction
         self.pair_proj_left = nn.Linear(d_model, d_pair)
         self.pair_proj_right = nn.Linear(d_model, d_pair)
+        
+        # --- NEW: The Mix-Down Layer for Concatenation ---
+        self.pair_mixer = nn.Linear(d_pair * 2, d_pair)
+        # -------------------------------------------------
+        
         self.max_dist = 32
         self.rel_pos_emb = nn.Embedding(self.max_dist * 2 + 1, d_pair)
         self.pair_norm = nn.LayerNorm(d_pair)
+
         
-        # 3. 1D Backbone
         cos, sin = precompute_freqs(d_model // nhead, max_len=max_len)
         self.register_buffer('rope_cos', cos)
         self.register_buffer('rope_sin', sin)
-
+        
+        # 3. 1D Backbone
         self.layers = nn.ModuleList([
             OneDTransformerBlock(
                 d_model, nhead, dim_feedforward, dropout
@@ -260,26 +248,28 @@ class EarlyBranchingConfidenceNetwork(nn.Module):
         self.disto_head = DistogramHead(d_pair=d_pair, bins=64)
         self.spatial_pooler = SpatialAttentionPooler(d_model=d_model, bins=64)
         self.geometry_head = GaussianGeometryHead(d_model=d_model, hidden=head_hidden)
-        self.plddt_head = pLDDTHead(d_model=d_model, hidden=head_hidden)
 
     def forward(self, tokens, src_key_padding_mask=None):
         B, L = tokens.shape
         
-        # 1. Extract 1D sequence and scale variance
+        # 1. Extract 1D sequence
         x = self.embedder(tokens)
         x = x * math.sqrt(self.d_model)
 
-        # 2. Extract Early 2D Pair Track (Layer 0)
-        left = self.pair_proj_left(x).unsqueeze(2)  
-        right = self.pair_proj_right(x).unsqueeze(1) 
-        pair_track = left + right 
+        # 2. Early 2D Pair Track (Layer 0)
+        left = self.pair_proj_left(x)   # [B, L, d_pair]
+        right = self.pair_proj_right(x) # [B, L, d_pair]
         
+        # Outer Addition + Outer Product (Rich feature mixing without doubling dims!)
+        pair_track = left.unsqueeze(2) + right.unsqueeze(1)
+        pair_track = pair_track + (left.unsqueeze(2) * right.unsqueeze(1))
+        
+        # Add relative distances exactly like before
         positions = torch.arange(L, device=x.device)
         distances = positions.unsqueeze(1) - positions.unsqueeze(0)
         distances = torch.clamp(distances, -self.max_dist, self.max_dist) + self.max_dist 
         pair_track = pair_track + self.rel_pos_emb(distances).unsqueeze(0)
         
-        # Pre-normalize the Pair Track
         pair_track = self.pair_norm(pair_track)
 
         # 3. Prep Masks
@@ -296,16 +286,20 @@ class EarlyBranchingConfidenceNetwork(nn.Module):
         for layer in self.layers:
             x = checkpoint(layer, x, cos, sin, padding_mask_bool, use_reentrant=False)
 
-        # 5. Distogram Prediction & Shielding
+        # 5. Distogram Prediction & THE GRADIENT SHIELD
         disto_logits = self.disto_head(pair_track)
-        d_probs = F.softmax(disto_logits.detach(), dim=-1)
+        d_probs = F.softmax(disto_logits, dim=-1)
         
         # 6. Spatial Context & Geometry
         disto_context = self.spatial_pooler(x, d_probs, pair_mask=pair_mask)
         pred_1d = self.geometry_head(x, disto_context)
         
-        # 7. Independent Confidence Audit
-        # Detach 'x' so pLDDT gradients do not backpropagate through the Transformer
-        plddt_scores = self.plddt_head(x.detach())
-        
-        return pred_1d, plddt_scores, disto_logits
+        return pred_1d, disto_logits
+    
+
+def precompute_freqs(dim, max_len=4096, theta=10000.0):
+    """Precomputes Rotary Positional Embedding frequencies."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(max_len, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    return torch.cos(freqs), torch.sin(freqs)

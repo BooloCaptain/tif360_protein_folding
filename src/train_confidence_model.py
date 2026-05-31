@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from collections import defaultdict
 from torchview import draw_graph
 
-from src.postproc.visualize import kabsch_align, plot_protein_comparison
+from src.postproc.visualize import kabsch_align, plot_geometry_error_per_residue, plot_protein_comparison
 from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.data.batching import MaxTokensBatchSampler
@@ -29,47 +29,12 @@ from src.utils.structure_eval import (
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-# ==========================================
-# PHASE 2 LOSS & TARGET GENERATORS
-# ==========================================
-def compute_pseudo_lddt(true_coords, pred_coords, mask_1d, cutoff=15.0):
-    """
-    Calculates ground-truth C-alpha LDDT on the fly.
-    Returns scores in range [0, 100].
-    """
-    B, L, _ = true_coords.shape
-    
-    # Calculate pairwise distance matrices
-    true_d = torch.cdist(true_coords, true_coords)
-    pred_d = torch.cdist(pred_coords, pred_coords)
-    
-    # Create neighborhood mask: Only care about residues within 15A in the TRUE structure
-    valid_mask = (true_d < cutoff) & (true_d > 1e-4) & mask_1d.unsqueeze(1) & mask_1d.unsqueeze(2)
-    
-    diff = torch.abs(true_d - pred_d)
-    
-    # LDDT thresholds
-    score = 0.25 * (
-        (diff < 0.5).float() + 
-        (diff < 1.0).float() + 
-        (diff < 2.0).float() + 
-        (diff < 4.0).float()
-    )
-    
-    score = score * valid_mask.float()
-    
-    # Average over valid neighbors, clamp to prevent div by zero
-    norm = valid_mask.sum(dim=-1).clamp(min=1e-4)
-    plddt = score.sum(dim=-1) / norm
-    
-    return plddt * 100.0
-
 def gaussian_nll_loss(pred_1d, target_angles, target_distances, mask_1d):
     """
     Calculates Negative Log-Likelihood (NLL) for the Gaussian Head.
-    pred_1d indices: [0:2]=mu_theta(sin,cos), [2]=logvar_theta, [3:5]=mu_tau(sin,cos), [5]=logvar_tau, [6]=mu_d, [7]=logvar_d
+    target_angles is expected to be [B, L, 4] -> (sin_theta, cos_theta, sin_tau, cos_tau)
     """
-    # 1. Extract Means and Log-Variances
+    # 1. Extract means and log-variances.
     mu_theta = pred_1d[..., 0:2]
     logvar_theta = pred_1d[..., 2:3]
     
@@ -79,20 +44,13 @@ def gaussian_nll_loss(pred_1d, target_angles, target_distances, mask_1d):
     mu_d = pred_1d[..., 6:7]
     logvar_d = pred_1d[..., 7:8]
     
-    # 2. Extract Targets & Convert Radians to Sin/Cos
-    # target_angles shape is [B, L, 2] representing (theta_rad, tau_rad)
-    true_theta_rad = target_angles[..., 0:1]
-    true_tau_rad = target_angles[..., 1:2]
-    
-    target_theta = torch.cat([torch.sin(true_theta_rad), torch.cos(true_theta_rad)], dim=-1)
-    target_tau = torch.cat([torch.sin(true_tau_rad), torch.cos(true_tau_rad)], dim=-1)
-    
+    # 2. Extract precomputed sin/cos targets.
+    target_theta = target_angles[..., 0:2]
+    target_tau = target_angles[..., 2:4]
     target_d = target_distances.unsqueeze(-1)
     
-    # 3. Calculate NLL for each component: 0.5 * e^(-logvar) * (mu - target)^2 + 0.5 * logvar
     def nll(mu, target, logvar):
         mse = F.mse_loss(mu, target, reduction='none')
-        # Average MSE across features (like sin/cos) before applying variance
         if mse.shape[-1] > 1:
             mse = mse.mean(dim=-1, keepdim=True)
         return 0.5 * torch.exp(-logvar) * mse + 0.5 * logvar
@@ -180,12 +138,12 @@ def build_loader(cfg):
     if data_cfg.get("dynamic_batching", True):
         lengths = [ds.get_length(i) for i in range(len(ds))]
         sampler = MaxTokensBatchSampler(lengths, max_tokens=max_tokens, megabatch_size=megabatch_size)
-        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate_fn, num_workers=16, 
-                          prefetch_factor=3, persistent_workers=True, pin_memory=True)
+        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate_fn, num_workers=12, 
+                          prefetch_factor=2, persistent_workers=False, pin_memory=False)
 
     batch_size = as_int(train_cfg.get("batch_size", 8), 8)
     return DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=15, 
-                      prefetch_factor=3, persistent_workers=True, pin_memory=True)
+                      prefetch_factor=3, persistent_workers=True, pin_memory=False)
 
 def get_infinite_batches(loader):
     while True:
@@ -214,9 +172,102 @@ def build_valid_eval_loader(cfg):
 
     return DataLoader(
         ds, collate_fn=collate_fn, batch_size=batch_size, shuffle=False,
-        pin_memory=torch.cuda.is_available(), num_workers=num_workers,
-        persistent_workers=(num_workers > 0),
+        pin_memory=False, num_workers=num_workers,
+        persistent_workers=False,
     )
+
+
+# ==========================================
+# 3D LOSS FUNCTIONS
+# ==========================================
+def compute_distogram_loss(disto_logits, target_coords, mask_1d):
+    """Calculates the 2D Direct Distogram Loss calibrated for uncertainty thresholding."""
+    B, L, _ = target_coords.shape
+    device = disto_logits.device
+    
+    # 1. Calculate True Pairwise Distances
+    diff = target_coords.unsqueeze(2) - target_coords.unsqueeze(1)
+    target_pdists = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
+    
+    # 2. Bin Targets
+    num_bins = 64
+    target_bins = torch.floor((target_pdists - 2.0) / (22.0 - 2.0) * num_bins).long()
+    target_bins = torch.clamp(target_bins, min=0, max=num_bins - 1)
+    
+    # 3. 2D Masking
+    mask_2d = mask_1d.unsqueeze(-1) * mask_1d.unsqueeze(-2)
+    target_bins_masked = target_bins.clone()
+    target_bins_masked[mask_2d == 0] = -100 # Ignore index
+    
+    if (target_bins_masked == -100).all():
+        return torch.tensor(0.0, device=device)
+        
+    # 4. Raw Cross-Entropy with LABEL SMOOTHING
+    # This prevents overconfidence and forces the network to output 
+    # calibrated probabilities that you can actually trust for thresholding.
+    raw_disto_loss = F.cross_entropy(
+        disto_logits.float().permute(0, 3, 1, 2), 
+        target_bins_masked, 
+        ignore_index=-100,
+        reduction='none',
+        label_smoothing=0.05
+    )
+    
+    # 5. Continuous Sequence Separation Math
+    seq_idx = torch.arange(L, device=device)
+    seq_separation = torch.abs(seq_idx.unsqueeze(0) - seq_idx.unsqueeze(1)).float() 
+    seq_separation = seq_separation.unsqueeze(0) # [1, L, L]
+    
+    # Scale from 1.0 (local) to 5.0 (long-range)
+    scaled_sep = torch.clamp(seq_separation / 100.0, min=0.0, max=1.0)
+    seq_weight = 1.0 + (4.0 * scaled_sep) 
+    
+    # 6. SYMMETRIC Class Weighting
+    # We maintain a gentle 2.0x boost for contacts just to combat the massive 
+    # O(L^2) background imbalance, but we drop the 5.0x asymmetric bomb.
+    is_contact = target_pdists < 8.0 
+    class_weight = torch.where(is_contact, 2.0, 1.0)
+    
+    # Both false positives and false negatives at long ranges now face the 5.0x penalty!
+    weight_matrix = seq_weight * class_weight
+    
+    # 7. Apply weights and calculate mean
+    weighted_loss = raw_disto_loss * weight_matrix
+    valid_pixels = (target_bins_masked != -100)
+    
+    return weighted_loss[valid_pixels].mean()
+
+
+def compute_local_window_3d_loss(pred_coords, target_coords, mask_1d, window_size=16):
+    """
+    Computes a continuous sliding-window Distance RMSD (dRMSD).
+    Breaks Torsion Mode Collapse while maintaining stable, lever-arm-free gradients.
+    """
+    B, L, _ = pred_coords.shape
+    device = pred_coords.device
+    
+    pred_pdists = torch.cdist(pred_coords, pred_coords)
+    true_pdists = torch.cdist(target_coords[..., :3], target_coords[..., :3])
+    
+    # Absolute Error (L1) for stability
+    error_matrix = torch.abs(pred_pdists - true_pdists)
+    
+    # Local "Chunk" Mask
+    seq_idx = torch.arange(L, device=device)
+    seq_separation = torch.abs(seq_idx.unsqueeze(0) - seq_idx.unsqueeze(1))
+    
+    window_mask = (seq_separation > 0) & (seq_separation <= window_size)
+    window_mask = window_mask.unsqueeze(0).expand(B, -1, -1)
+    
+    valid_mask = mask_1d.unsqueeze(-1).bool() & mask_1d.unsqueeze(-2).bool()
+    final_mask = window_mask & valid_mask
+    
+    valid_errors = error_matrix[final_mask]
+    
+    if valid_errors.numel() == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+        
+    return valid_errors.mean()
 
 
 # ==========================================
@@ -228,13 +279,13 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
 
     metric_names = [
         'rmsd', 'gdt_ts', 'tm_score', 'full_drmsd', 'helix_drmsd', 'sheet_drmsd',
-        'top_l_3d', 'top_l_2d', 'steric_clashes', 'plddt_mae'
+        'top_l_3d', 'top_l_2d', 'steric_clashes'
     ]
     global_values = {name: [] for name in metric_names}
 
     total_eval_nll = 0.0
-    total_eval_plddt = 0.0
     total_eval_disto = 0.0
+    total_eval_3d_local = 0.0
     total_batches = 0
     total_samples = 0
 
@@ -247,11 +298,14 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
             padding_mask = batch["pad_mask"].to(device, non_blocking=True)
             target_coords = batch["coords"].to(device, non_blocking=True)
 
+            angles = torch.nan_to_num(angles, nan=0.0)
+            distances = torch.nan_to_num(distances, nan=0.0)
+            target_coords = torch.nan_to_num(target_coords, nan=0.0)
+
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                pred_1d, plddt_scores, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
+                pred_1d, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
 
                 pred_1d = pred_1d.float()
-                plddt_scores = plddt_scores.float()
                 disto_logits = disto_logits.float()
 
                 # Extract Means for NeRF
@@ -260,20 +314,17 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
                 mu_d = pred_1d[..., 6:7]
                 pred_means = torch.cat([mu_theta, mu_tau, mu_d], dim=-1)
                 
-                pred_coords = angles_to_3d_coords_memory_safe(pred_means, tokens, device)
-                
                 # Losses
                 nll_loss = gaussian_nll_loss(pred_1d, angles, distances, mask_1d)
-                
-                # disto_loss (CrossEntropy implementation assumed or standard MSE if probabilities)
                 d_probs = F.softmax(disto_logits, dim=-1)
-                
-                # pLDDT Loss
-                target_plddt = compute_pseudo_lddt(target_coords[..., :3], pred_coords, mask_1d)
-                plddt_loss = F.mse_loss(plddt_scores * mask_1d.float(), target_plddt * mask_1d.float())
+            
+            with torch.autocast(device_type=device.type, enabled=False):
+                pred_coords = angles_to_3d_coords_memory_safe(pred_means.float(), tokens, device)
+                loss_3d_local = compute_local_window_3d_loss(pred_coords, target_coords.float(), mask_1d, window_size=16)
 
             total_eval_nll += nll_loss.item()
-            total_eval_plddt += plddt_loss.item()
+            total_eval_disto += compute_distogram_loss(disto_logits, target_coords[..., :3], mask_1d).item()
+            total_eval_3d_local += loss_3d_local.item()
             total_batches += 1
 
             pred_coords_cpu = pred_coords.float().cpu().numpy()
@@ -281,8 +332,8 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
             mask_1d_cpu = mask_1d.cpu().numpy()
             disto_logits_gpu = disto_logits.detach()
             
-            plddt_mae = F.l1_loss(plddt_scores[mask_1d.bool()], target_plddt[mask_1d.bool()]).item()
-            global_values['plddt_mae'].append(plddt_mae)
+            # Extract target SS for contiguous dRMSD
+            target_ss_cpu = batch["target_ss"].cpu().numpy()
 
             B = tokens.shape[0]
             for b in range(B):
@@ -290,6 +341,7 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
                 pred_np = pred_coords_cpu[b, :L, :]
                 target_coords_np = target_coords_cpu[b, :L, :3]
                 mask_1d_np = mask_1d_cpu[b, :L]
+                target_ss_np = target_ss_cpu[b, :L]
                 
                 valid_mask = (mask_1d_np > 0) & ~np.isnan(target_coords_np).any(axis=1)
                 valid_len = int(valid_mask.sum())
@@ -298,6 +350,7 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
 
                 eval_pred_coords = pred_np[valid_mask]
                 eval_true_coords = target_coords_np[valid_mask]
+                eval_target_ss = target_ss_np[valid_mask]
 
                 if np.isnan(eval_pred_coords).any() or np.isinf(eval_pred_coords).any():
                     continue 
@@ -308,6 +361,15 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
                 gdt_val = calculate_gdt_ts(aligned_pred_coords, eval_true_coords)
                 tm_val = calculate_tm_score(aligned_pred_coords, eval_true_coords)
                 top_l_prec_3d = calculate_top_l_half_long_contact_precision(eval_pred_coords, eval_true_coords)
+
+                # --- ADDED: Contiguous Secondary Structure dRMSD ---
+                # We use np.ones for the confidence array because we are evaluating raw base performance.
+                ss_drmsd = compute_contiguous_drmsd(
+                    eval_pred_coords, 
+                    eval_true_coords, 
+                    eval_target_ss, 
+                    np.ones(valid_len, dtype=np.float32)
+                )
 
                 viz_disto_logits = disto_logits_gpu[b, :L, :L]
                 viz_probs = F.softmax(viz_disto_logits.float(), dim=-1)
@@ -325,6 +387,9 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
                     'rmsd': rmsd_val,
                     'gdt_ts': gdt_val,
                     'tm_score': tm_val,
+                    'full_drmsd': ss_drmsd.get("full_drmsd", float('nan')),
+                    'helix_drmsd': ss_drmsd.get("intra_helix_drmsd", float('nan')),
+                    'sheet_drmsd': ss_drmsd.get("intra_sheet_drmsd", float('nan')),
                     'top_l_3d': top_l_prec_3d,
                     'top_l_2d': top_l_prec_2d,
                     'steric_clashes': steric_clashes,
@@ -336,7 +401,8 @@ def evaluate_valid_split(model, loader, device, lambda_disto):
 
     summary = {
         'val_nll_loss': total_eval_nll / max(1, total_batches),
-        'val_plddt_loss': total_eval_plddt / max(1, total_batches),
+        'val_disto_loss': total_eval_disto / max(1, total_batches),
+        'val_3d_local_loss': total_eval_3d_local / max(1, total_batches),
         'val_samples': total_samples,
     }
 
@@ -381,6 +447,8 @@ def main():
     min_lr_ratio = train_cfg.get("min_lr_ratio", 0.1) 
     total_steps = train_cfg.get("total_steps", 10000)
 
+    
+
     def lr_schedule_fn(step):
         if step < warmup_steps: 
             return float(step) / float(max(1, warmup_steps))
@@ -406,6 +474,7 @@ def main():
     model.train()
 
     lambda_disto = as_float(cfg.get("loss", {}).get("lambda_disto", 0.5), 0.5)
+    lambda_3d_local = as_float(cfg.get("loss", {}).get("lambda_3d_local", 0.5), 0.5)
     valid_eval_interval = as_int(train_cfg.get("valid_eval_interval", logging_interval), logging_interval)
 
     optimizer.zero_grad(set_to_none=True)
@@ -419,6 +488,7 @@ def main():
     if resume_from_checkpoint and os.path.exists(ckpt_path):
         print(f"[INFO] Found checkpoint at {ckpt_path}. Resuming training...")
         ckpt = torch.load(ckpt_path, map_location=device)
+        
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt and ckpt["scheduler"] is not None and scheduler is not None:
@@ -429,7 +499,8 @@ def main():
         print(f"[INFO] No checkpoint found. Starting from scratch.")
 
     average_nll_loss = 0.0
-    average_plddt_loss = 0.0
+    average_disto_loss = 0.0
+    average_3d_local_loss = 0.0  # NEW: Track 3D loss
     batch_idx = 0
 
     while global_step < total_steps:
@@ -441,34 +512,43 @@ def main():
         distances = batch["distances"].to(device, non_blocking=True)
         padding_mask = batch["pad_mask"].to(device, non_blocking=True)
         target_coords = batch["coords"].to(device, non_blocking=True)
+        target_ss = batch["target_ss"].to(device, non_blocking=True)
+
+        angles = torch.nan_to_num(angles, nan=0.0)
+        distances = torch.nan_to_num(distances, nan=0.0)
+        target_coords = torch.nan_to_num(target_coords, nan=0.0)
 
         valid_tokens_in_batch = mask_1d.sum().item()
         total_tokens_seen += int(valid_tokens_in_batch)
 
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            pred_1d, plddt_scores, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
+            pred_1d, disto_logits = model(tokens, src_key_padding_mask=padding_mask)
             
             # 1. NLL Geometry Loss
             nll_loss = gaussian_nll_loss(pred_1d, angles, distances, mask_1d)
             
-            # 2. Extract means and build 3D structure for pLDDT validation
             mu_theta = pred_1d[..., 0:2]
             mu_tau = pred_1d[..., 3:5]
             mu_d = pred_1d[..., 6:7]
             pred_means = torch.cat([mu_theta, mu_tau, mu_d], dim=-1)
             
-            # Generate coordinates (detached if you don't want gradients flowing through NeRF)
-            pred_coords = angles_to_3d_coords_memory_safe(pred_means, tokens, device)
+        with torch.autocast(device_type=device.type, enabled=False):
+            # Float() cast ensures cumulative matrix multiplications don't disintegrate
+            pred_coords = angles_to_3d_coords_memory_safe(pred_means.float(), tokens, device)
             
-            # 3. pLDDT Loss
-            target_plddt = compute_pseudo_lddt(target_coords[..., :3], pred_coords, mask_1d)
-            plddt_loss = F.mse_loss(plddt_scores * mask_1d.float(), target_plddt * mask_1d.float())
+            # --- NEW: SLIDING WINDOW 3D LOSS ---
+            # Calculated outside bfloat16 to avoid NaN/Infs in cdist
+            loss_3d_local = compute_local_window_3d_loss(pred_coords, target_coords.float(), mask_1d, window_size=16)
 
-            # Total Loss
-            loss_total = nll_loss + (0.1 * plddt_loss) # Downweight pLDDT loss to prevent instability
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            disto_loss = compute_distogram_loss(disto_logits, target_coords[..., :3], mask_1d)
+            
+            # --- NEW: Added loss_3d_local to the total backward pass ---
+            loss_total = nll_loss + (lambda_disto * disto_loss) + (lambda_3d_local * loss_3d_local)
 
         average_nll_loss += nll_loss.item()
-        average_plddt_loss += plddt_loss.item()
+        average_disto_loss += disto_loss.item()
+        average_3d_local_loss += loss_3d_local.item()
 
         scaled_loss = loss_total / accumulation_steps
         scaled_loss.backward()
@@ -487,14 +567,17 @@ def main():
 
                 train_stats = {
                     'train_nll': average_nll_loss / log_div,
-                    'train_plddt': average_plddt_loss / log_div,
+                    'train_disto': average_disto_loss / log_div,
+                    'train_3d_local': average_3d_local_loss / log_div, # NEW LOGGING
                 }
 
                 print(f"Global Step: {global_step:5d} | Tokens: {total_tokens_seen / 1e6:.2f}M | "
-                      f"lr={current_lr:.6f} | NLL={train_stats['train_nll']:.4f} | pLDDT_MSE={train_stats['train_plddt']:.4f}")
+                      f"lr={current_lr:.6f} | NLL={train_stats['train_nll']:.4f} | "
+                      f"Disto={train_stats['train_disto']:.4f} | Local_3D={train_stats['train_3d_local']:.4f}")
 
                 average_nll_loss = 0.0
-                average_plddt_loss = 0.0
+                average_disto_loss = 0.0
+                average_3d_local_loss = 0.0
                 
                 # --- VIZUALIZATION LOGIC ---
                 viz_index = 0
@@ -514,19 +597,48 @@ def main():
                     
                     disto_save_path = f"{output_dir}/disto_step_{global_step:06d}.png"
                     plot_distograms(pred_disto=expected_bins, true_disto=true_bins, save_path=disto_save_path)
-
+                
+                # Combined uncertainty score (Mean of log-variances)
+                node_vars = torch.mean(
+                    torch.cat([pred_1d[viz_index, :valid_len, 2:3], 
+                               pred_1d[viz_index, :valid_len, 5:6]], dim=-1), 
+                    dim=-1
+                ).cpu().detach().numpy()
+                
+                # Pass the combined_var to the plotter
+                edge_vars = pred_1d[viz_index, :valid_len, 7:8].cpu().detach().numpy().flatten()
+                
+                true_valid = target_coords[viz_index, :valid_len].cpu().numpy()
+                pred_valid = pred_coords[viz_index, :valid_len].cpu().detach().float().numpy()
+                
                 plot_protein_comparison(
                     true_coords=true_valid, 
                     pred_coords=pred_valid, 
-                    title=f"Global Step {global_step} (Tokens: {total_tokens_seen / 1e6:.2f}M)",
+                    node_vars=node_vars,
+                    edge_vars=edge_vars,
+                    title=f"Step {global_step} Uncertainty",
                     filename=f"{output_dir}/train_step_{global_step:06d}.html"
+                )
+
+                plot_geometry_error_per_residue(
+                    pred_1d=pred_1d[viz_index],
+                    target_angles=angles[viz_index],
+                    target_distances=distances[viz_index],
+                    target_ss=target_ss[viz_index],
+                    mask_1d=mask_1d[viz_index], # The mask with the missing data filtered out!
+                    save_path=f"{output_dir}/geom_error_step_{global_step:06d}.png"
                 )
 
                 if global_step % valid_eval_interval == 0:
                     eval_summary = evaluate_valid_split(model, valid_eval_loader, device, lambda_disto)
                     print(
-                        f"VALID | NLL={eval_summary['val_nll_loss']:.4f} | pLDDT_MAE={eval_summary['val_plddt_mae']:.2f} | "
-                        f"TM={eval_summary['val_tm_score']:.4f} | GDT_TS={eval_summary['val_gdt_ts']:.4f}"
+                        f"VALID | NLL={eval_summary['val_nll_loss']:.4f} | "
+                        f"Disto Loss={eval_summary['val_disto_loss']:.4f} | "
+                        f"Local 3D={eval_summary['val_3d_local_loss']:.4f} | "
+                        f"TM={eval_summary['val_tm_score']:.4f} | "
+                        f"GDT_TS={eval_summary['val_gdt_ts']:.4f} | "
+                        f"Helix dRMSD={eval_summary['val_helix_drmsd']:.4f} | "
+                        f"Sheet dRMSD={eval_summary['val_sheet_drmsd']:.4f} | "
                     )
 
                     csv_row = {'global_step': global_step, 'total_tokens_seen': total_tokens_seen}

@@ -6,7 +6,7 @@ data:
   split: train
   max_len: 200
   max_len_valid: 200
-  max_len_test: 2048
+  max_len_test: 4096
   subset_size_valid: 100
   subset_size_test: 100
   use_sidechainnet_if_available: true
@@ -14,10 +14,10 @@ data:
 
 model:
   vocab_size: 33
-  d_model: 512
+  d_model: 128
   nhead: 8
-  num_layers: 6
-  dim_feedforward: 2048
+  num_layers: 3
+  dim_feedforward: 516
   dropout: 0.1
   max_len: 4096
   head_hidden: 128
@@ -25,33 +25,39 @@ model:
   arch_override: early_branching_confidence_network
 
 training:
-  resume_from_checkpoint: true
+  resume_from_checkpoint: false
   max_tokens: 2500
   accumulation_steps: 8
   megabatch_size: 10000
-  lr: 5e-4
+  lr: 5e-4 
   min_lr_ratio: 0.01
   total_steps: 20000
   warmup_steps: 2000
   decay_steps: 20000
+  warmup_steps_3d: 1000
+  warmup_steps_band_mask: 1000
+  max_band_mask_size: 200
   logging_interval: 100
   checkpoint_interval: 500
-  checkpoint_path: checkpoints/early_branching_confidence_rope_3d_loss.pt
+  checkpoint_path: checkpoints/early_branching_confidence_mini.pt
   compile: false
 
-loss:        
-  lambda_disto: 0.5
-  lambda_3d_local: 0.25
+loss:
+  lambda_distance: 1.0   
+  lambda_3d: 0.05         
+  lambda_ss: 0.1         
+  lambda_disto: 2.0      
+  use_3d_loss: false
 
 inference:
   max_tokens: 2500
-  checkpoint_path: checkpoints/early_branching_confidence_rope_3d_loss.pt
+  checkpoint_path: checkpoints/early_branching_confidence_mini.pt
 
 postproc:
   use_nerf: true
   nerf_impl: mpnerf
 
 export:
-  output_dir: outputs/early_branching_confidence_rope_3d_loss
+  output_dir: outputs/early_branching_confidence_mini
   pdb: true
   gltf: true
