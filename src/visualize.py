@@ -132,7 +132,8 @@ def plot_diagonal_split_matrix(matrix_true, matrix_pred, true_ss, pred_ss, title
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    plt.close()
+    fig.clf()
+    plt.close(fig)
 
 
 # ==========================================

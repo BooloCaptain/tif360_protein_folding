@@ -163,6 +163,20 @@ def build_model_from_cfg(cfg: Dict[str, Any]):
 			d_pair=int(model_cfg.get("d_pair", 128)),
 			head_hidden=int(model_cfg.get("head_hidden", 128)),
 		)
+	
+	elif arch_override == "iterative_diamond_confidence_network":
+		print("[INFO] Factory Override: Loading hardcoded IterativeDiamondConfidenceNetwork")
+		from src.models.iterative_diamond_confidence_network import IterativeDiamondConfidenceNetwork
+		return IterativeDiamondConfidenceNetwork(
+			d_model=int(model_cfg.get("d_model", 256)),
+			nhead=int(model_cfg.get("nhead", 8)),
+			num_layers=int(model_cfg.get("num_layers", 6)),
+			dim_feedforward=int(model_cfg.get("dim_feedforward", 1024)),
+			dropout=float(model_cfg.get("dropout", 0.1)),
+			max_len=int(model_cfg.get("max_len", 4096)),
+			d_pair=int(model_cfg.get("d_pair", 128)),
+			head_hidden=int(model_cfg.get("head_hidden", 128)),
+		)
 
 	spec = _spec_from_config(cfg)
 

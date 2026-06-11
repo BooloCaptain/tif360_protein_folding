@@ -11,7 +11,14 @@ from src.utils.config import get_config_from_cli_or_env
 from src.data.dataset_full import ProteinDataset, collate_fn
 from src.models.factory import build_model_from_cfg
 from src.postproc.exporters import write_pdb
-from src.postproc.visualize import kabsch_align
+from src.postproc.visualize import (
+    kabsch_align,
+    plot_distogram_analysis_large_text, 
+    plot_protein_comparison,
+    plot_gaussian_ramachandran,
+    plot_distogram_analysis,
+    plot_tau_error_per_residue
+)
 from src.utils.structure_eval import (
     angles_to_3d_coords_memory_safe,
     calculate_gdt_ts,
@@ -85,14 +92,50 @@ def distogram_kinematics(disto_logits, disto_span=20.0, disto_offset=2.0):
     entropy = -(probs * log_probs).sum(dim=-1)
     return expected_dists, entropy
 
+# ==========================================
+# FULLY DECOUPLED L-BFGS REFINEMENT
+# ==========================================
+def compute_softened_steric_loss(coords, clash_threshold=3.8, seq_exclusion=2):
+    """
+    Computes a differentiable, gradient-safe steric clash penalty.
+    coords: [L, 3] tensor of C-alpha coordinates.
+    clash_threshold: 3.8A is standard for C-alpha to C-alpha distances.
+    seq_exclusion: Ignore atoms within N sequence steps of each other (chemically bonded).
+    """
+    L = coords.shape[0]
+    
+    # 1. Calculate all pairwise distances
+    diff = coords.unsqueeze(1) - coords.unsqueeze(0)
+    dists = torch.norm(diff + 1e-8, dim=-1)
+    
+    # 2. Calculate violations (Only distances LESS than threshold are positive)
+    # This is the ReLU hook: max(0, threshold - distance)
+    violations = F.relu(clash_threshold - dists)
+    
+    # 3. Create Exclusion Mask
+    seq_idx = torch.arange(L, device=coords.device)
+    seq_sep = torch.abs(seq_idx.unsqueeze(0) - seq_idx.unsqueeze(1))
+    valid_mask = seq_sep > seq_exclusion
+    
+    # 4. Apply Quadratic Smoothing
+    # Squaring the violation prevents a sharp, non-differentiable "kink" at exactly 3.8A
+    loss_matrix = (violations ** 2) * valid_mask.float()
+    
+    # Average the penalty over valid pairs to keep gradients scale-invariant
+    valid_count = valid_mask.sum().clamp(min=1.0)
+    return loss_matrix.sum() / valid_count
+
+
 def masked_torsion_refinement_lbfgs(
-    pred_means, expected_dists, log_var, entropy, tokens, device,
-    steps=10, lr=1.0, contact_cutoff=150.0, log_var_threshold=-3.0, entropy_threshold=1.0
+    pred_means, expected_dists, log_var_theta, log_var_tau, entropy, tokens, device,
+    steps=5, lr=1.0, contact_cutoff=16.0, log_var_threshold_theta=-1.0, log_var_threshold_tau=-2.0, entropy_threshold=4.0, clash_weight=10.0
 ):
     optimizable_angles = pred_means.clone().detach().float().requires_grad_(True)
     optimizer = torch.optim.LBFGS([optimizable_angles], lr=float(lr), max_iter=20, line_search_fn="strong_wolfe")
 
-    is_rigid = (log_var < log_var_threshold).squeeze()
+    # Create independent rigid masks for theta and tau
+    is_rigid_theta = (log_var_theta < log_var_threshold_theta).squeeze()
+    is_rigid_tau = (log_var_tau < log_var_threshold_tau).squeeze()
 
     # Apply hard thresholding: keep pairs within distance AND below entropy threshold
     valid_pairs = (expected_dists < float(contact_cutoff)) & (entropy < float(entropy_threshold))
@@ -109,14 +152,28 @@ def masked_torsion_refinement_lbfgs(
         diff = coords.unsqueeze(1) - coords.unsqueeze(0)
         current_d = torch.norm(diff + 1e-8, dim=-1)
         
-        # Raw MSE on the strictly filtered subset
-        loss = F.mse_loss(current_d[valid_pairs], target_d)
-        loss.backward()
+        # 1. The Attractive Force (Distogram Constraints)
+        dist_loss = F.mse_loss(current_d[valid_pairs], target_d)
+        
+        # 2. The Repulsive Force (Softened Steric Clashes)
+        # We only pass the coordinates, letting the function handle internal masking
+        steric_loss = compute_softened_steric_loss(coords, clash_threshold=3.8, seq_exclusion=2)
+        
+        # Combine the losses
+        total_loss = dist_loss + (clash_weight * steric_loss)
+        
+        total_loss.backward()
 
         if optimizable_angles.grad is not None:
-            optimizable_angles.grad[:, is_rigid, :] = 0.0
+            # Freeze confident theta angles (indices 0, 1)
+            optimizable_angles.grad[:, is_rigid_theta, 0:2] = 0.0
+            
+            # Freeze confident tau angles (indices 2, 3)
+            optimizable_angles.grad[:, is_rigid_tau, 2:4] = 0.0
+            
+            # Distance is always frozen (index 4)
             optimizable_angles.grad[:, :, 4] = 0.0    
-        return loss
+        return total_loss
 
     for step in range(int(steps)):
         loss = optimizer.step(closure)
@@ -136,11 +193,11 @@ def main():
     subset_size_test = data_cfg.get("subset_size_test", None)
     print(f"[INFO] Loading real protein test dataset (Subset: {subset_size_test})...")
     ds = ProteinDataset(
-        split="valid-10", casp_version=12, thinning=30,
+        split="test", casp_version=12, thinning=30,
         max_len=data_cfg.get("max_len_test", 4096), subset_size=subset_size_test,
         filter_max_len=True
     )
-    loader = DataLoader(ds, collate_fn=collate_fn, batch_size=1, shuffle=False, num_workers=4)
+    loader = DataLoader(ds, collate_fn=collate_fn, batch_size=1, shuffle=False, num_workers=2, persistent_workers=True)
 
     model_cfg = cfg.get("model", {})
     model = build_model_from_cfg(model_cfg).to(device)
@@ -157,8 +214,11 @@ def main():
     results = []
     
     # Dataset-wide Confidence Accumulators
-    global_pred_logvar = []
-    global_true_angle_err = []
+    global_logvar_theta = []
+    global_err_theta = []
+    
+    global_logvar_tau = []
+    global_err_tau = []
     
     out_cfg = cfg.get("export", {})
     out_dir = out_cfg.get("output_dir", "outputs/evaluation_results")
@@ -186,17 +246,31 @@ def main():
                     base_pred_coords = angles_to_3d_coords_memory_safe(pred_means, tokens, device)
                 
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                    # --- EXTRACT CONFIDENCE TARGETS FOR CALIBRATION ---
-                    log_var_theta = pred_1d[..., 2]
+                    # --- EXTRACT CONFIDENCE AND ANGLES ---
+                    log_var_theta = pred_1d[..., 2] # Index 2 is log_var for Theta
+                    log_var_tau = pred_1d[..., 5]   # Index 5 is log_var for Tau
+                    
                     target_coords_gpu = torch.nan_to_num(batch["coords"][..., :3].to(device), nan=0.0)
                     target_angles_gpu = torch.nan_to_num(batch["angles"].to(device), nan=0.0)
                     mask_1d_gpu = batch["mask_1d"].to(device)
                     
-                    # True 1D Error
+                    # Compute Radian Angles for Theta (Phi)
                     true_theta_rad = torch.atan2(target_angles_gpu[..., 0], target_angles_gpu[..., 1])
                     pred_theta_rad = torch.atan2(mu_theta[..., 0], mu_theta[..., 1])
-                    angle_diff = torch.abs(pred_theta_rad - true_theta_rad)
-                    true_angle_error = torch.minimum(angle_diff, 2 * math.pi - angle_diff)
+                    
+                    # Compute Radian Angles for Tau (Psi)
+                    true_tau_rad = torch.atan2(target_angles_gpu[..., 2], target_angles_gpu[..., 3])
+                    pred_tau_rad = torch.atan2(mu_tau[..., 0], mu_tau[..., 1])
+                    
+                    # Calculate true Angle Error for Tau (accounting for 360 wrap-around)
+                    tau_diff = torch.abs(pred_tau_rad - true_tau_rad)
+                    true_tau_error_rad = torch.minimum(tau_diff, 2 * math.pi - tau_diff)
+                    true_tau_error_deg = torch.rad2deg(true_tau_error_rad)
+
+                    # Calculate true Angle Error for Theta
+                    theta_diff = torch.abs(pred_theta_rad - true_theta_rad)
+                    true_theta_error_rad = torch.minimum(theta_diff, 2 * math.pi - theta_diff)
+                    true_theta_error_deg = torch.rad2deg(true_theta_error_rad)
 
         L = batch["lengths"][0]
         expected_dists, entropy = distogram_kinematics(disto_logits)
@@ -205,8 +279,9 @@ def main():
         entropy = entropy[0, :L, :L]
         
         with torch.enable_grad():
+            # Pass BOTH log_var_theta and log_var_tau to refinement
             refined_means = masked_torsion_refinement_lbfgs(
-                pred_means[:, :L, :], expected_dists, log_var_theta[0, :L], entropy, tokens[:, :L], device
+                pred_means[:, :L, :], expected_dists, log_var_theta[0, :L], log_var_tau[0, :L], entropy, tokens[:, :L], device
             )
         with torch.no_grad():
             ref_pred_coords = angles_to_3d_coords_memory_safe(refined_means, tokens[:, :L], device)
@@ -224,8 +299,11 @@ def main():
         if valid_len < 15: continue 
             
         # Accumulate Dataset Calibration Metrics
-        global_pred_logvar.extend(log_var_theta[0, :L].float().cpu().numpy()[valid_mask])
-        global_true_angle_err.extend(true_angle_error[0, :L].float().cpu().numpy()[valid_mask])
+        global_logvar_theta.extend(log_var_theta[0, :L].float().cpu().numpy()[valid_mask])
+        global_err_theta.extend(true_theta_error_deg[0, :L].float().cpu().numpy()[valid_mask])
+        
+        global_logvar_tau.extend(log_var_tau[0, :L].float().cpu().numpy()[valid_mask])
+        global_err_tau.extend(true_tau_error_deg[0, :L].float().cpu().numpy()[valid_mask])
 
         eval_true_coords = target_coords_cpu[valid_mask]
         base_eval_coords = base_coords_cpu[valid_mask]
@@ -279,16 +357,77 @@ def main():
             print(f"{total_samples_processed:05d}   | {valid_len:<4} | {bucket:<6} | {base_tm:<7.3f} | {ref_tm:<7.3f} | {base_rmsd:<9.2f} | {ref_rmsd:<9.2f} | {base_clash:<10.2f} | {ref_clash:<10.2f}")
             
         export_freq = max(1, int(subset_size_test / 10) if subset_size_test else 10)
+        
+        # ==========================================
+        # DIAGNOSTIC VISUALIZATION EXPORTS
+        # ==========================================
         if total_samples_processed % export_freq == 0: 
             write_pdb(os.path.join(out_dir, f"test_{total_samples_processed:05d}_base.pdb"), base_aligned)
             write_pdb(os.path.join(out_dir, f"test_{total_samples_processed:05d}_refined.pdb"), ref_aligned)
             write_pdb(os.path.join(out_dir, f"test_{total_samples_processed:05d}_true.pdb"), eval_true_coords)
             
-            plot_path = os.path.join(out_dir, f"test_{total_samples_processed:05d}_3way_plot.html")
+            # PLOT 1: Baseline 3-Way Structural Trace
             plot_title = f"Sample {total_samples_processed} | Base (TM: {base_tm:.2f}) vs Refined (TM: {ref_tm:.2f})"
             plot_three_way_comparison(
                 true_coords=eval_true_coords, base_coords=base_aligned, ref_coords=ref_aligned, 
-                title=plot_title, filename=plot_path
+                title=plot_title, filename=os.path.join(out_dir, f"test_{total_samples_processed:05d}_3way_plot.html")
+            )
+            
+            # PLOT 2: The Angular Error vs Uncertainty Tube
+            valid_tau_error_deg = true_tau_error_deg[0, :L].cpu().numpy()[valid_mask]
+            valid_tau_logvar = log_var_tau[0, :L].cpu().numpy()[valid_mask]
+
+            plot_protein_comparison(
+                true_coords=eval_true_coords, 
+                pred_coords=base_aligned, 
+                angle_error_deg=valid_tau_error_deg, 
+                uncertainty=valid_tau_logvar,
+                title=f"Sample {total_samples_processed} | Tau Error vs Uncertainty",
+                filename=os.path.join(out_dir, f"test_{total_samples_processed:05d}_3d_error_confidence.html")
+            )
+
+            # PLOT 3: The Gaussian Ramachandran Map
+            v_pred_theta = pred_theta_rad[0, :L].cpu().numpy()[valid_mask]
+            v_pred_tau = pred_tau_rad[0, :L].cpu().numpy()[valid_mask]
+            v_true_theta = true_theta_rad[0, :L].cpu().numpy()[valid_mask]
+            v_true_tau = true_tau_rad[0, :L].cpu().numpy()[valid_mask]
+
+            plot_gaussian_ramachandran(
+                pred_theta_rad=v_pred_theta, pred_tau_rad=v_pred_tau, 
+                true_theta_rad=v_true_theta, true_tau_rad=v_true_tau,
+                log_var_tau=valid_tau_logvar,
+                title=f"Sample {total_samples_processed} | Gaussian Ramachandran Map",
+                filename=os.path.join(out_dir, f"test_{total_samples_processed:05d}_gaussian_ramachandran.png")
+            )
+
+            # PLOT 4: Side-by-Side Distogram Diagnostics (Signed Error & Entropy)
+            valid_disto_logits = disto_logits[0, :L, :L, :].cpu().float().numpy()[valid_mask][:, valid_mask]
+            
+            plot_distogram_analysis(
+                disto_logits=valid_disto_logits,
+                true_coords=eval_true_coords,
+                pred_coords=base_aligned,
+                title=f"Sample {total_samples_processed} | Distogram Analysis",
+                filename=os.path.join(out_dir, f"test_{total_samples_processed:05d}_distogram_analysis.png")
+            )
+
+            # 1. NEW TAU ERROR PLOT
+            plot_tau_error_per_residue(
+                pred_1d=pred_1d[0, :L],                 # <--- ADD :L HERE
+                target_angles=target_angles_gpu[0, :L], # <--- ADD :L HERE
+                target_ss=target_ss_cpu,                # (Already sliced to :L earlier)
+                mask_1d=mask_1d,                        # (Already sliced to :L earlier)
+                save_path=os.path.join(out_dir, f"test_{total_samples_processed:05d}_tau_error.png")
+            )
+            
+            # 2. UPDATED DISTOGRAM ANALYSIS PLOT
+            valid_disto_logits = disto_logits[0, :L, :L, :].cpu().float().numpy()[valid_mask][:, valid_mask]
+            plot_distogram_analysis_large_text(
+                disto_logits=valid_disto_logits,
+                true_coords=eval_true_coords,
+                pred_coords=base_aligned,
+                title=f"Sample {total_samples_processed} | Distogram Analysis",
+                filename=os.path.join(out_dir, f"test_{total_samples_processed:05d}_distogram_analysis_large_text.png")
             )
             
         total_samples_processed += 1
@@ -371,26 +510,35 @@ def main():
     print("CONFIDENCE METRICS CALIBRATION (Spearman & Bins)")
     print("="*65)
     
-    pred_logvar_np = np.array(global_pred_logvar)
-    true_angle_err_np = np.array(global_true_angle_err)
-    
-    var_corr, _ = spearmanr(pred_logvar_np, true_angle_err_np)
-    
-    print(f"Gaussian Variance Correlation (1D): {var_corr:.4f} (Closer to 1.0 is better)")
-    print("-" * 65)
+    def print_calibration_curve(logvar_list, err_list, angle_name):
+        logvar_np = np.array(logvar_list)
+        err_np = np.array(err_list)
+        
+        var_corr, _ = spearmanr(logvar_np, err_np)
+        print(f"\n{angle_name.upper()} Variance Correlation (1D): {var_corr:.4f} (Closer to 1.0 is better)")
+        print("-" * 65)
+        
+        print(f"{angle_name.upper()} GAUSSIAN VARIANCE CALIBRATION CURVE:")
+        print(f"{'Predicted Log-Var Bin':<20} | {'Mean Angle Error':<15} | {'Count':<10}")
 
-    print("-" * 65)
-    print("GAUSSIAN VARIANCE CALIBRATION CURVE:")
-    print(f"{'Predicted Log-Var Bin':<20} | {'Mean Angle Error':<15} | {'Count':<10}")
-    var_bins = np.linspace(-12, 0, 13)
-    var_digitized = np.digitize(pred_logvar_np, var_bins)
-    for i in range(1, len(var_bins)):
-        mask = (var_digitized == i)
-        count = mask.sum()
-        mean_true = np.degrees(true_angle_err_np[mask].mean()) if count > 0 else 0.0
-        bin_label = f"{var_bins[i-1]:.1f} to {var_bins[i]:.1f}"
-        print(f"{bin_label:<20} | {mean_true:<10.1f} deg | {count:<10}")
-    print("=" * 65)
+        min_logvar_floor = np.floor(np.min(logvar_np))
+        max_logvar_ceil = np.ceil(np.max(logvar_np))
+        
+        var_bins = np.linspace(min_logvar_floor, max_logvar_ceil, int(max_logvar_ceil - min_logvar_floor) + 1)
+        var_digitized = np.digitize(logvar_np, var_bins)
+        
+        for i in range(1, len(var_bins)):
+            mask = (var_digitized == i)
+            count = mask.sum()
+            # Notice the np.degrees BUG is fixed here!
+            mean_true = err_np[mask].mean() if count > 0 else 0.0 
+            bin_label = f"{var_bins[i-1]:.1f} to {var_bins[i]:.1f}"
+            print(f"{bin_label:<20} | {mean_true:<10.1f} deg | {count:<10}")
+        print("=" * 65)
+
+    # Print the independent calibration curves
+    print_calibration_curve(global_logvar_theta, global_err_theta, "Theta (Phi)")
+    print_calibration_curve(global_logvar_tau, global_err_tau, "Tau (Psi)")
 
     csv_path = os.path.join(out_dir, "evaluation_metrics_comparison.csv")
     with open(csv_path, "w", newline="") as f:

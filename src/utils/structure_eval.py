@@ -209,14 +209,29 @@ def calculate_top_l_half_long_contact_precision_2d(contact_probs, target_coords,
     return np.sum(top_tgt_dists <= threshold) / top_n
 
 
-def calculate_steric_clashes(pred_coords, seq_sep=3, clash_threshold=3.2):
+def calculate_steric_clashes(pred_coords, seq_sep=3, clash_threshold=3.8):
+    """
+    A continuous severity metric for C-alpha traces.
+    Instead of counting binary clashes, it sums the total Ångströms of penetration
+    and averages it per residue, punishing deep overlaps much harder than grazing ones.
+    """
     L = len(pred_coords)
     if L < seq_sep:
         return 0.0
 
     diff = pred_coords[:, None, :] - pred_coords[None, :, :]
     dists = np.linalg.norm(diff, axis=-1)
+    
     i, j = np.triu_indices(L, k=seq_sep)
     non_adj_dists = dists[i, j]
-    clashes = np.sum(non_adj_dists < clash_threshold)
-    return (clashes / L) * 100
+    
+    # Calculate continuous penetration (how deep the clash is)
+    # ca_vdw_sum is usually ~3.8A for adjacent C-alphas, so a clash threshold 
+    # of 3.8 is standard for detecting C-alpha crumpling.
+    penetrations = np.maximum(0, clash_threshold - non_adj_dists)
+    
+    # Sum the total Ångströms of overlap and normalize by length
+    # This heavily penalizes a 1.0A distance, while gently penalizing a 3.7A distance
+    total_severity = np.sum(penetrations)
+    
+    return total_severity / L

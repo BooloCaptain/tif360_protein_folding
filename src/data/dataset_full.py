@@ -120,6 +120,8 @@ class ProteinDataset(Dataset):
                 self.data = rng.sample(self.data, self.subset_size)
                 print(f"[WARNING] Stratified sampling failed: {e}. Randomly truncated to {len(self.data)} proteins.")
 
+        print(f"[INFO] {self.split.upper()} dataset initialized with {len(self.data)} proteins.")
+
 
     def _parse_raw_data(self, raw_data, target_split):
         """Pivots SidechainNet's dict-of-lists into a list-of-dicts for __getitem__"""

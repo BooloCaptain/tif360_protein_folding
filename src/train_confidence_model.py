@@ -31,10 +31,10 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 def gaussian_nll_loss(pred_1d, target_angles, target_distances, mask_1d):
     """
-    Calculates Negative Log-Likelihood (NLL) for the Gaussian Head.
-    target_angles is expected to be [B, L, 4] -> (sin_theta, cos_theta, sin_tau, cos_tau)
+    Calculates NLL, while applying a gentle, bounded "Compass Loss" 
+    to prevent 180-degree chiral traps without causing mode collapse.
     """
-    # 1. Extract means and log-variances.
+    # 1. Extract means and log-variances
     mu_theta = pred_1d[..., 0:2]
     logvar_theta = pred_1d[..., 2:3]
     
@@ -43,27 +43,46 @@ def gaussian_nll_loss(pred_1d, target_angles, target_distances, mask_1d):
     
     mu_d = pred_1d[..., 6:7]
     logvar_d = pred_1d[..., 7:8]
+
+    clamped_logvar_theta = torch.clamp(logvar_theta, min=-4.0, max=4.0)
+    clamped_logvar_tau = torch.clamp(logvar_tau, min=-4.0, max=4.0)
+    clamped_logvar_d = torch.clamp(logvar_d, min=-4.0, max=4.0)
     
-    # 2. Extract precomputed sin/cos targets.
     target_theta = target_angles[..., 0:2]
     target_tau = target_angles[..., 2:4]
     target_d = target_distances.unsqueeze(-1)
     
+    # 2. Compute the standard NLL
     def nll(mu, target, logvar):
         mse = F.mse_loss(mu, target, reduction='none')
         if mse.shape[-1] > 1:
             mse = mse.mean(dim=-1, keepdim=True)
         return 0.5 * torch.exp(-logvar) * mse + 0.5 * logvar
         
-    loss_theta = nll(mu_theta, target_theta, logvar_theta)
-    loss_tau = nll(mu_tau, target_tau, logvar_tau)
-    loss_d = nll(mu_d, target_d, logvar_d)
+    loss_theta = nll(mu_theta, target_theta, clamped_logvar_theta)
+    loss_tau = nll(mu_tau, target_tau, clamped_logvar_tau)
+    loss_d = nll(mu_d, target_d, clamped_logvar_d)
     
     total_nll = (loss_theta + loss_tau + loss_d).squeeze(-1)
     
-    # Apply 1D mask
     masked_nll = total_nll * mask_1d.float()
-    return masked_nll.sum() / mask_1d.sum().clamp(min=1.0)
+    final_nll = masked_nll.sum() / mask_1d.sum().clamp(min=1.0)
+    
+    # ========================================================
+    # THE DECOUPLED COMPASS (Fixes chirality safely)
+    # ========================================================
+    # Calculate pure MSE on the angular vectors, completely ignoring logvar.
+    # Because they are unit vectors, max error is 4.0. It cannot explode.
+    compass_theta = F.mse_loss(mu_theta, target_theta, reduction='none').mean(dim=-1)
+    compass_tau = F.mse_loss(mu_tau, target_tau, reduction='none').mean(dim=-1)
+    
+    total_compass = (compass_theta + compass_tau) * mask_1d.float()
+    final_compass = total_compass.sum() / mask_1d.sum().clamp(min=1.0)
+    
+    # We add it with a small 0.1 weight. 
+    # If the network claims high uncertainty (NLL drops) but the angle is backwards (180 deg),
+    # this compass loss will persistently tug the mean vector towards the correct chirality.
+    return final_nll + (0.1 * final_compass)
 
 
 # ==========================================
@@ -91,7 +110,8 @@ def plot_distograms(pred_disto, true_disto, save_path="disto_debug.png"):
     
     plt.tight_layout()
     plt.savefig(save_path)
-    plt.close()
+    fig.clf()
+    plt.close(fig)
 
 
 def set_seed(seed):
@@ -138,12 +158,10 @@ def build_loader(cfg):
     if data_cfg.get("dynamic_batching", True):
         lengths = [ds.get_length(i) for i in range(len(ds))]
         sampler = MaxTokensBatchSampler(lengths, max_tokens=max_tokens, megabatch_size=megabatch_size)
-        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate_fn, num_workers=12, 
-                          prefetch_factor=2, persistent_workers=False, pin_memory=False)
+        return DataLoader(ds, batch_sampler=sampler, collate_fn=collate_fn, num_workers=2, persistent_workers=True, pin_memory=False)
 
     batch_size = as_int(train_cfg.get("batch_size", 8), 8)
-    return DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=15, 
-                      prefetch_factor=3, persistent_workers=True, pin_memory=False)
+    return DataLoader(ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=2, persistent_workers=True, pin_memory=False)
 
 def get_infinite_batches(loader):
     while True:
@@ -160,7 +178,6 @@ def build_valid_eval_loader(cfg):
     max_len = data_cfg.get("max_len_valid", data_cfg.get("max_len_test", data_cfg.get("max_len", 4096)))
     subset_size = data_cfg.get("subset_size_valid", 1)
     batch_size = as_int(data_cfg.get("valid_batch_size", data_cfg.get("eval_batch_size", 4)), 4)
-    num_workers = as_int(data_cfg.get("valid_num_workers", 4), 4)
 
     ds = ProteinDataset(
         split="valid-10",
@@ -172,8 +189,8 @@ def build_valid_eval_loader(cfg):
 
     return DataLoader(
         ds, collate_fn=collate_fn, batch_size=batch_size, shuffle=False,
-        pin_memory=False, num_workers=num_workers,
-        persistent_workers=False,
+        pin_memory=False, num_workers=2,
+        persistent_workers=True,
     )
 
 
@@ -200,11 +217,9 @@ def compute_distogram_loss(disto_logits, target_coords, mask_1d):
     target_bins_masked[mask_2d == 0] = -100 # Ignore index
     
     if (target_bins_masked == -100).all():
-        return torch.tensor(0.0, device=device)
+        return torch.tensor(0.0, device=device, requires_grad=True)
         
     # 4. Raw Cross-Entropy with LABEL SMOOTHING
-    # This prevents overconfidence and forces the network to output 
-    # calibrated probabilities that you can actually trust for thresholding.
     raw_disto_loss = F.cross_entropy(
         disto_logits.float().permute(0, 3, 1, 2), 
         target_bins_masked, 
@@ -218,30 +233,37 @@ def compute_distogram_loss(disto_logits, target_coords, mask_1d):
     seq_separation = torch.abs(seq_idx.unsqueeze(0) - seq_idx.unsqueeze(1)).float() 
     seq_separation = seq_separation.unsqueeze(0) # [1, L, L]
     
-    # Scale from 1.0 (local) to 5.0 (long-range)
     scaled_sep = torch.clamp(seq_separation / 100.0, min=0.0, max=1.0)
     seq_weight = 1.0 + (4.0 * scaled_sep) 
     
     # 6. SYMMETRIC Class Weighting
-    # We maintain a gentle 2.0x boost for contacts just to combat the massive 
-    # O(L^2) background imbalance, but we drop the 5.0x asymmetric bomb.
     is_contact = target_pdists < 8.0 
     class_weight = torch.where(is_contact, 2.0, 1.0)
     
-    # Both false positives and false negatives at long ranges now face the 5.0x penalty!
     weight_matrix = seq_weight * class_weight
-    
-    # 7. Apply weights and calculate mean
     weighted_loss = raw_disto_loss * weight_matrix
-    valid_pixels = (target_bins_masked != -100)
     
-    return weighted_loss[valid_pixels].mean()
+    # ========================================================
+    # 7. BATCH-SAFE AVERAGING (The Fix)
+    # ========================================================
+    valid_pixels_mask = (target_bins_masked != -100).float()
+    
+    # Sum the loss for EACH protein independently [Shape: B]
+    loss_per_protein = (weighted_loss * valid_pixels_mask).sum(dim=(1, 2))
+    
+    # Count the valid pixels for EACH protein [Shape: B]
+    pixels_per_protein = valid_pixels_mask.sum(dim=(1, 2)).clamp(min=1.0)
+    
+    # Get the true mean per protein, then average across the batch!
+    mean_loss_per_protein = loss_per_protein / pixels_per_protein
+    
+    return mean_loss_per_protein.mean()
 
 
 def compute_local_window_3d_loss(pred_coords, target_coords, mask_1d, window_size=16):
     """
     Computes a continuous sliding-window Distance RMSD (dRMSD).
-    Breaks Torsion Mode Collapse while maintaining stable, lever-arm-free gradients.
+    Uses Batch-Safe Per-Protein Averaging to prevent length domination.
     """
     B, L, _ = pred_coords.shape
     device = pred_coords.device
@@ -262,12 +284,23 @@ def compute_local_window_3d_loss(pred_coords, target_coords, mask_1d, window_siz
     valid_mask = mask_1d.unsqueeze(-1).bool() & mask_1d.unsqueeze(-2).bool()
     final_mask = window_mask & valid_mask
     
-    valid_errors = error_matrix[final_mask]
+    # ========================================================
+    # BATCH-SAFE AVERAGING (Length Bias Fix)
+    # ========================================================
+    final_mask_float = final_mask.float()
     
-    if valid_errors.numel() == 0:
-        return torch.tensor(0.0, device=device, requires_grad=True)
-        
-    return valid_errors.mean()
+    # 1. Sum the absolute error for EACH protein [Shape: B]
+    loss_per_protein = (error_matrix * final_mask_float).sum(dim=(1, 2))
+    
+    # 2. Count the valid window pairs for EACH protein [Shape: B]
+    pairs_per_protein = final_mask_float.sum(dim=(1, 2)).clamp(min=1.0)
+    
+    # 3. Calculate true mean per protein, then average the batch
+    mean_loss_per_protein = loss_per_protein / pairs_per_protein
+
+    final_3d_loss = mean_loss_per_protein.mean()
+    
+    return final_3d_loss
 
 
 # ==========================================
@@ -473,8 +506,9 @@ def main():
 
     model.train()
 
+    lambda_geom = as_float(cfg.get("loss", {}).get("lambda_geom", 1.0), 1.0)
     lambda_disto = as_float(cfg.get("loss", {}).get("lambda_disto", 0.5), 0.5)
-    lambda_3d_local = as_float(cfg.get("loss", {}).get("lambda_3d_local", 0.5), 0.5)
+    lambda_3d_local = as_float(cfg.get("loss", {}).get("lambda_3d_local", 1.0), 1.0)
     valid_eval_interval = as_int(train_cfg.get("valid_eval_interval", logging_interval), logging_interval)
 
     optimizer.zero_grad(set_to_none=True)
@@ -544,7 +578,7 @@ def main():
             disto_loss = compute_distogram_loss(disto_logits, target_coords[..., :3], mask_1d)
             
             # --- NEW: Added loss_3d_local to the total backward pass ---
-            loss_total = nll_loss + (lambda_disto * disto_loss) + (lambda_3d_local * loss_3d_local)
+            loss_total = (lambda_geom * nll_loss) + (lambda_disto * disto_loss) + (lambda_3d_local * loss_3d_local)
 
         average_nll_loss += nll_loss.item()
         average_disto_loss += disto_loss.item()
@@ -614,8 +648,8 @@ def main():
                 plot_protein_comparison(
                     true_coords=true_valid, 
                     pred_coords=pred_valid, 
-                    node_vars=node_vars,
-                    edge_vars=edge_vars,
+                    angle_error_deg=torch.acos(torch.clamp(torch.sum(pred_1d[viz_index, :valid_len, 0:2] * angles[viz_index, :valid_len, 0:2], dim=-1), -1.0, 1.0)).detach().cpu().numpy(),
+                    uncertainty=node_vars,
                     title=f"Step {global_step} Uncertainty",
                     filename=f"{output_dir}/train_step_{global_step:06d}.html"
                 )
