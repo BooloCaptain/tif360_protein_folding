@@ -27,6 +27,7 @@ training:
 
 loss:
   lambda_distance: 0.5
+  use_3d_loss: false
 
 inference:
   num_samples: 256

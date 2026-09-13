@@ -30,7 +30,7 @@ model:
   #   - 'two_track' (or 'full'): 2D biases 1D attention, AND 1D updates the 2D track via outer product.
   #   - 'pair_bias' (or 'pair_input'): 2D biases 1D attention, but 2D track is NOT updated (saves VRAM).
   #   - '1d' (or 'standard'): 2D track is ignored. Standard Transformer.
-  block_type: 1d 
+  block_type: two_track
   
   # head_mode controls how geometry and secondary structure (SS) are predicted:
   #   - 'direct': Predicts 5D geometry and 8-state SS in parallel from the 1D hidden state.
@@ -50,21 +50,21 @@ model:
 
 training:
   resume_from_checkpoint: false
-  max_tokens: 3333
+  max_tokens: 1000
   megabatch_size: 10000
   lr: 1e-4 
   min_lr_ratio: 0.001
-  total_steps: 10000
-  warmup_steps: 1000
-  decay_steps: 10000
-  warmup_steps_3d: 1000
-  warmup_steps_band_mask: 1000
+  total_steps: 4000
+  warmup_steps: 400
+  decay_steps: 4000
+  warmup_steps_3d: 400
+  warmup_steps_band_mask: 400
   max_band_mask_size: 200
   logging_interval: 100
   checkpoint_interval: 500
-  checkpoint_path: checkpoints/phase1_full_mini.pt
+  checkpoint_path: checkpoints/phase1_full_twotrack.pt
   compile: false
-  accumulation_steps: 4
+  accumulation_steps: 20
 
 loss:
   lambda_distance: 1.0   
@@ -75,13 +75,13 @@ loss:
 
 inference:
   max_tokens: 5000
-  checkpoint_path: checkpoints/phase1_full_mini.pt
+  checkpoint_path: checkpoints/phase1_full_twotrack.pt
 
 postproc:
   use_nerf: true
   nerf_impl: mpnerf
 
 export:
-  output_dir: outputs/full_eval
+  output_dir: outputs/full_eval_twotrack
   pdb: true
   gltf: true

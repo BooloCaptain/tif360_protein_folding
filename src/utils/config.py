@@ -27,6 +27,17 @@ def load_config(path=None):
 
     with open(path, "r") as f:
         data = yaml.safe_load(f)
+
+    # Normalize loss defaults for training behavior toggles.
+    if data is None:
+        data = {}
+    loss_cfg = data.setdefault("loss", {})
+    # 3D reconstruction loss is opt-in to reduce VRAM usage during training.
+    loss_cfg.setdefault("use_3d_loss", False)
+    # Deprecated: remove stale RoG weight if present.
+    if "lambda_rog" in loss_cfg:
+        loss_cfg.pop("lambda_rog", None)
+
     return data
 
 

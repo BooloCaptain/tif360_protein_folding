@@ -30,7 +30,7 @@ model:
   #   - 'two_track' (or 'full'): 2D biases 1D attention, AND 1D updates the 2D track via outer product.
   #   - 'pair_bias' (or 'pair_input'): 2D biases 1D attention, but 2D track is NOT updated (saves VRAM).
   #   - '1d' (or 'standard'): 2D track is ignored. Standard Transformer.
-  block_type: 1d 
+  block_type: 1d
   
   # head_mode controls how geometry and secondary structure (SS) are predicted:
   #   - 'direct': Predicts 5D geometry and 8-state SS in parallel from the 1D hidden state.
@@ -46,42 +46,42 @@ model:
   esm_unfreeze_last_n: 0
   
   # Inject the global 2D spatial awareness pool back into the final 1D sequence track before the head?
-  pair_context_to_head: true
+  pair_context_to_head: false
 
 training:
-  resume_from_checkpoint: false
+  resume_from_checkpoint: true
   max_tokens: 3333
+  accumulation_steps: 6
   megabatch_size: 10000
-  lr: 1e-4 
+  lr: 5e-4
   min_lr_ratio: 0.001
-  total_steps: 10000
-  warmup_steps: 1000
-  decay_steps: 10000
-  warmup_steps_3d: 1000
-  warmup_steps_band_mask: 1000
+  total_steps: 4000
+  warmup_steps: 400
+  decay_steps: 4000
+  warmup_steps_3d: 400
+  warmup_steps_band_mask: 400
   max_band_mask_size: 200
   logging_interval: 100
   checkpoint_interval: 500
-  checkpoint_path: checkpoints/phase1_full_mini.pt
+  checkpoint_path: checkpoints/phase1_full_1d_3d_loss.pt
   compile: false
-  accumulation_steps: 4
 
 loss:
   lambda_distance: 1.0   
-  lambda_3d: 0.1         
+  lambda_3d: 0.02       
   lambda_ss: 0.1         
   lambda_disto: 1.0      
-  use_3d_loss: false
+  use_3d_loss: true
 
 inference:
   max_tokens: 5000
-  checkpoint_path: checkpoints/phase1_full_mini.pt
+  checkpoint_path: checkpoints/phase1_full_1d_3d_loss.pt
 
 postproc:
   use_nerf: true
   nerf_impl: mpnerf
 
 export:
-  output_dir: outputs/full_eval
+  output_dir: outputs/full_eval_1d_3d_loss
   pdb: true
   gltf: true
